@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ask a question
+    url: https://github.com/aymenoppa/jobly/discussions/new?category=q-a
+    about: How do I do something in Jobly? Ask in Discussions, where anyone can answer.
+  - name: Report a security problem
+    url: https://github.com/aymenoppa/jobly/security/advisories/new
+    about: Please report vulnerabilities privately, not in a public issue.
