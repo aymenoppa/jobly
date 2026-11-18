@@ -1,0 +1,150 @@
+{
+  "id": "general",
+  "name": "General / Other",
+  "description": "A simple starting point for any service business.",
+  "services": [
+    {
+      "name": "Service call",
+      "unit": "visit",
+      "unit_price": 95
+    },
+    {
+      "name": "Labor",
+      "unit": "hr",
+      "unit_price": 75
+    },
+    {
+      "name": "Trip charge",
+      "unit": "visit",
+      "unit_price": 35
+    },
+    {
+      "name": "Minimum charge",
+      "unit": "visit",
+      "unit_price": 150
+    },
+    {
+      "name": "Materials at cost",
+      "unit": "lump sum",
+      "unit_price": 0
+    }
+  ],
+  "formulas": [],
+  "checklists": [
+    {
+      "name": "Job completion",
+      "items": [
+        {
+          "key": "work_completed_as_quoted",
+          "label": "Work completed as quoted",
+          "type": "check",
+          "required": true
+        },
+        {
+          "key": "site_cleaned_up",
+          "label": "Site cleaned up",
+          "type": "check",
+          "required": true
+        },
+        {
+          "key": "after_photo",
+          "label": "After photo",
+          "type": "photo",
+          "required": true
+        },
+        {
+          "key": "client_signature",
+          "label": "Client signature",
+          "type": "signature",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "Service call report",
+      "services": [
+        "Service call",
+        "Trip charge",
+        "Minimum charge"
+      ],
+      "items": [
+        {
+          "key": "problem_found",
+          "label": "Problem found",
+          "type": "text",
+          "required": true
+        },
+        {
+          "key": "work_done",
+          "label": "Work done",
+          "type": "text",
+          "required": true
+        },
+        {
+          "key": "parts_used",
+          "label": "Parts used",
+          "type": "text",
+          "required": false
+        },
+        {
+          "key": "photos",
+          "label": "Photos",
+          "type": "photo",
+          "required": false
+        },
+        {
+          "key": "client_signature",
+          "label": "Client signature",
+          "type": "signature",
+          "required": false
+        }
+      ]
+    }
+  ],
+  "intake_forms": [
+    {
+      "name": "Request a free estimate",
+      "slug": "request-a-free-estimate",
+      "kind": "request",
+      "requires_approval": false,
+      "lead_time_days": 1,
+      "questions": [
+        {
+          "key": "address",
+          "label": "Service address",
+          "type": "address",
+          "required": true
+        },
+        {
+          "key": "details",
+          "label": "What do you need done?",
+          "type": "long_text",
+          "required": true
+        },
+        {
+          "key": "timing",
+          "label": "When would you like it done?",
+          "type": "choice",
+          "required": false,
+          "options": [
+            "As soon as possible",
+            "In the next few weeks",
+            "Just getting prices"
+          ]
+        },
+        {
+          "key": "photos",
+          "label": "Photos",
+          "type": "photos",
+          "required": false
+        }
+      ]
+    }
+  ],
+  "weather_rules": [],
+  "sop_categories": [
+    "Safety",
+    "Customer service",
+    "Equipment"
+  ]
+}

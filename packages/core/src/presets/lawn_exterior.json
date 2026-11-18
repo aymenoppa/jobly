@@ -1,0 +1,322 @@
+{
+  "id": "lawn_exterior",
+  "name": "Lawn & Exterior Maintenance",
+  "description": "Recurring mowing, seasonal services (leaves, snow, holiday lights), exterior cleaning and commercial grounds plans.",
+  "services": [
+    {
+      "name": "Weekly mow",
+      "unit": "visit",
+      "unit_price": 55,
+      "unit_cost": 28,
+      "formula_name": "Mowing price per visit"
+    },
+    {
+      "name": "Bi-weekly mow",
+      "unit": "visit",
+      "unit_price": 65,
+      "unit_cost": 33,
+      "formula_name": "Bi-weekly mowing price per visit"
+    },
+    {
+      "name": "Fertilizer application",
+      "unit": "visit",
+      "unit_price": 65,
+      "unit_cost": 24,
+      "formula_name": "Fertilizer price per visit"
+    },
+    {
+      "name": "Core aeration",
+      "unit": "visit",
+      "unit_price": 140,
+      "unit_cost": 55,
+      "formula_name": "Aeration price"
+    },
+    {
+      "name": "Overseeding",
+      "unit": "visit",
+      "unit_price": 180,
+      "unit_cost": 85,
+      "formula_name": "Overseeding price"
+    },
+    {
+      "name": "Mulch install",
+      "unit": "cu yd",
+      "unit_price": 95,
+      "unit_cost": 45
+    },
+    {
+      "name": "Hedge and shrub trimming",
+      "unit": "hr",
+      "unit_price": 70,
+      "unit_cost": 32
+    },
+    {
+      "name": "Spring cleanup",
+      "unit": "visit",
+      "unit_price": 275,
+      "unit_cost": 140
+    },
+    {
+      "name": "Fall cleanup",
+      "unit": "visit",
+      "unit_price": 325,
+      "unit_cost": 165
+    },
+    {
+      "name": "Leaf cleanup",
+      "unit": "visit",
+      "unit_price": 250,
+      "unit_cost": 130
+    },
+    {
+      "name": "Gutter cleaning",
+      "unit": "visit",
+      "unit_price": 175,
+      "unit_cost": 80
+    },
+    {
+      "name": "House power wash",
+      "unit": "visit",
+      "unit_price": 350,
+      "unit_cost": 150
+    },
+    {
+      "name": "Window cleaning",
+      "unit": "pane",
+      "unit_price": 10,
+      "unit_cost": 4,
+      "formula_name": "Window panes"
+    },
+    {
+      "name": "Snow plowing",
+      "unit": "push",
+      "unit_price": 75,
+      "unit_cost": 35
+    },
+    {
+      "name": "Salt application",
+      "unit": "visit",
+      "unit_price": 120,
+      "unit_cost": 60
+    },
+    {
+      "name": "Holiday light install and takedown",
+      "unit": "visit",
+      "unit_price": 950,
+      "unit_cost": 450
+    },
+    {
+      "name": "Commercial grounds plan",
+      "unit": "month",
+      "unit_price": 1800,
+      "unit_cost": 1100
+    }
+  ],
+  "formulas": [
+    {
+      "name": "Mowing price per visit",
+      "formula": "max(45, area_sqft / 1000 * 4.5)",
+      "sets": "unit_price"
+    },
+    {
+      "name": "Bi-weekly mowing price per visit",
+      "formula": "max(55, area_sqft / 1000 * 5.5)",
+      "sets": "unit_price"
+    },
+    {
+      "name": "Window panes",
+      "formula": "count"
+    },
+    {
+      "name": "Fertilizer price per visit",
+      "formula": "max(55, area_sqft / 1000 * 13)",
+      "sets": "unit_price"
+    },
+    {
+      "name": "Aeration price",
+      "formula": "max(95, area_sqft / 1000 * 18)",
+      "sets": "unit_price"
+    },
+    {
+      "name": "Overseeding price",
+      "formula": "max(110, area_sqft / 1000 * 25)",
+      "sets": "unit_price"
+    }
+  ],
+  "checklists": [
+    {
+      "name": "Weekly mow standard",
+      "services": [
+        "Weekly mow",
+        "Bi-weekly mow"
+      ],
+      "items": [
+        {
+          "key": "mowed_trimmed_and_edged",
+          "label": "Mowed, trimmed and edged",
+          "type": "check",
+          "required": true
+        },
+        {
+          "key": "walks_and_drive_blown_off",
+          "label": "Walks and drive blown off",
+          "type": "check",
+          "required": true
+        },
+        {
+          "key": "gates_closed",
+          "label": "Gates closed",
+          "type": "check",
+          "required": true
+        },
+        {
+          "key": "anything_for_the_office",
+          "label": "Anything for the office?",
+          "type": "text",
+          "required": false
+        },
+        {
+          "key": "photo_if_something_is_wrong",
+          "label": "Photo, if something's wrong",
+          "type": "photo",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "Snow and salt route stop",
+      "services": [
+        "Snow plowing",
+        "Salt application"
+      ],
+      "items": [
+        {
+          "key": "lot_or_drive_cleared",
+          "label": "Lot or drive cleared",
+          "type": "check",
+          "required": true
+        },
+        {
+          "key": "walks_cleared",
+          "label": "Walks cleared",
+          "type": "check",
+          "required": true
+        },
+        {
+          "key": "salt_applied_lbs",
+          "label": "Salt applied (lbs)",
+          "type": "number",
+          "required": false
+        },
+        {
+          "key": "photo_on_completion",
+          "label": "Photo on completion",
+          "type": "photo",
+          "required": true
+        }
+      ]
+    }
+  ],
+  "intake_forms": [
+    {
+      "name": "Instant price: Gutter cleaning",
+      "slug": "instant-price-gutter-cleaning",
+      "kind": "booking",
+      "requires_approval": false,
+      "lead_time_days": 2,
+      "slot_minutes": 90,
+      "max_per_day": 4,
+      "questions": [
+        {
+          "key": "address",
+          "label": "Service address",
+          "type": "address",
+          "required": true
+        },
+        {
+          "key": "stories",
+          "label": "How many stories is your home?",
+          "type": "choice",
+          "required": true,
+          "options": [
+            "1-story",
+            "2-story",
+            "3-story"
+          ]
+        },
+        {
+          "key": "guards",
+          "label": "Gutter guards installed?",
+          "type": "yes_no",
+          "required": true
+        },
+        {
+          "key": "notes",
+          "label": "Notes",
+          "type": "long_text",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "Free estimate: Lawn and commercial grounds",
+      "slug": "free-estimate-lawn-and-commercial-grounds",
+      "kind": "request",
+      "requires_approval": false,
+      "lead_time_days": 1,
+      "questions": [
+        {
+          "key": "address",
+          "label": "Service address",
+          "type": "address",
+          "required": true
+        },
+        {
+          "key": "property_type",
+          "label": "Property type",
+          "type": "choice",
+          "required": true,
+          "options": [
+            "Home",
+            "HOA or apartments",
+            "Office or retail"
+          ]
+        },
+        {
+          "key": "services",
+          "label": "Services wanted",
+          "type": "multi_choice",
+          "required": true,
+          "options": [
+            "Mowing",
+            "Leaf cleanup",
+            "Snow removal",
+            "Power washing",
+            "Window cleaning",
+            "Holiday lights"
+          ]
+        }
+      ]
+    }
+  ],
+  "weather_rules": [
+    {
+      "applies_to": "Weekly mow",
+      "max_rain_pct": 70
+    },
+    {
+      "applies_to": "Bi-weekly mow",
+      "max_rain_pct": 70
+    },
+    {
+      "applies_to": "House power wash",
+      "min_temp_f": 40
+    }
+  ],
+  "sop_categories": [
+    "Safety",
+    "Mowing and trimming",
+    "Seasonal services",
+    "Equipment care"
+  ]
+}
