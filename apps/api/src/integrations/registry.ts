@@ -1,0 +1,442 @@
+/**
+ * Apps shown on the Apps page and how each connects.
+ *   oauth     - the company signs in to the provider; tokens are stored encrypted (integration_secrets)
+ *   api_key   - the company pastes a key (or the deployment provides one in env)
+ *   link      - calendars added by their ICS link (calendar_sources; see integrations/calendars.ts)
+ *   builtin   - part of Jobly, turned on or off for the company (team chat: companies.settings.team_chat;
+ *               website analytics: companies.settings.website_analytics, routes/analytics.ts; website
+ *               forms: companies.settings.website_forms, routes/websiteForms.ts; careers:
+ *               companies.settings.careers, the same routes; drive: companies.settings.drive,
+ *               routes/drive.ts; marketing: companies.settings.marketing, routes/marketing.ts;
+ *               paving and roofing: companies.settings.paving_app and .roofing_app, routes/paving.ts
+ *               and routes/roofing.ts; snow: .snow_app, routes/snow.ts)
+ *   site      - the company's website editor, by its address (Sveltia CMS: companies.settings.website, integrations/website.ts)
+ * ABC Supply is an api_key app with two keys: its own app's Client ID and secret (integrations/abcSupply.ts).
+ * Twilio is an api_key app with an Account SID, an Auth Token and the number texts go from (lib/twilio.ts).
+ * Lob is an api_key app: its secret key, test or live, mails postcard campaigns (integrations/lob.ts).
+ * Google Business Profile signs in like Google Calendar, with the same Google app, and brings the
+ * business's reviews into Marketing → Reviews while Marketing is installed (services/googleReviews.ts).
+ * Facebook & Instagram signs in with the business's own Meta app only (its App ID and secret pasted
+ * on its page): there's no server-wide Meta app. Its sign-in differs from the others' (a GET for the
+ * token, no refresh token, a long-lived token and a Page token), so integrations/meta.ts handles it;
+ * only the catalog entry and the sign-in page's address are here (services/social.ts posts).
+ * Claude and ChatGPT are api_key apps whose key powers Jobly's own AI (services/ai.ts); ChatGPT also lets
+ * each person sign in with their own ChatGPT plan (integrations/chatgptPlan.ts). Using Jobly from inside
+ * either chat app is the MCP connector at /mcp, added in Settings → AI assistants, and no app here.
+ */
+import type { Env } from "../env";
+import { DIALOG, GRAPH_VERSION, META_SCOPES } from "./metaConfig";
+
+/** Apps with a row in integrations (and maybe integration_secrets). */
+export type Provider = "quickbooks" | "zoho_books" | "google_calendar" | "google_business" | "meta" | "stripe" | "twilio" | "anthropic" | "chatgpt" | "fal" | "railway" | "abc_supply" | "lob" | "open_meteo";
+/** Apps whose calendars are added by link. They're also the calendar_sources.app values (with google_calendar). */
+export type LinkApp = "zoho_calendar" | "outlook_calendar" | "apple_calendar" | "ics_calendar";
+export type AppId = Provider | LinkApp | "team_chat" | "website_analytics" | "website_forms" | "careers" | "drive" | "marketing" | "paving" | "roofing" | "snow" | "sveltia";
+export type CalendarApp = LinkApp | "google_calendar";
+export const CALENDAR_APPS: readonly CalendarApp[] = ["google_calendar", "zoho_calendar", "outlook_calendar", "apple_calendar", "ics_calendar"];
+
+export interface CatalogEntry {
+  id: AppId;
+  name: string;
+  category: "Team" | "Marketing" | "Calendar" | "AI" | "Accounting" | "Payments" | "Pricing" | "Messaging" | "Website" | "Weather";
+  description: string;
+  auth: "oauth" | "api_key" | "link" | "connector" | "builtin" | "site";
+  docs: string;
+  /** False when this deployment lacks the OAuth app or platform key the provider needs. */
+  available: (env: Env) => boolean;
+  /**
+   * A company can sign in with its own app at the provider instead: it pastes that app's keys on the
+   * app's page (kept with its tokens, see oauthClient in tokens.ts), so nobody has to set up the server.
+   */
+  appKeys?: true;
+}
+
+export const CATALOG: CatalogEntry[] = [
+  {
+    id: "team_chat",
+    name: "Team Chat - Jobly",
+    category: "Team",
+    description: "Channels for the whole team, each crew and the office, with photos, @mentions and who's online.",
+    auth: "builtin",
+    docs: "https://jobly.com/docs/connections/team-chat/",
+    available: () => true,
+  },
+  {
+    id: "website_analytics",
+    name: "Website Analytics - Jobly",
+    category: "Team",
+    description: "See who visits your website, where they came from and which pages bring in booking requests, without cookies.",
+    auth: "builtin",
+    docs: "https://jobly.com/docs/connections/website-analytics/",
+    available: () => true,
+  },
+  {
+    id: "website_forms",
+    name: "Website Forms - Jobly",
+    category: "Team",
+    description: "Keep your website's own form and point it at Jobly: each message lands in Requests and your inbox, like Formspree.",
+    auth: "builtin",
+    docs: "https://jobly.com/docs/connections/website-forms/",
+    available: () => true,
+  },
+  {
+    id: "careers",
+    name: "Careers - Jobly",
+    category: "Team",
+    description: "Point the Apply form on your website at Jobly: each application, résumé and all, lands in Applicants for the office to work through.",
+    auth: "builtin",
+    docs: "https://jobly.com/docs/connections/careers/",
+    available: () => true,
+  },
+  {
+    id: "drive",
+    name: "Drive - Jobly",
+    category: "Team",
+    description: "Every file in one place: company folders, files on each client and job, Word and PDF editing, versions, a 30-day Trash and import from Google Drive.",
+    auth: "builtin",
+    docs: "https://jobly.com/docs/connections/drive/",
+    available: () => true,
+  },
+  {
+    id: "marketing",
+    name: "Marketing - Jobly",
+    category: "Team",
+    description: "Ask happy clients for Google reviews with reminders, and for referrals with a credit on their next invoice, and send email campaigns, automated ones too, with opens, clicks and the work they bring in.",
+    auth: "builtin",
+    docs: "https://jobly.com/docs/clients/marketing/",
+    available: () => true,
+  },
+  {
+    id: "paving",
+    name: "Paving - Jobly",
+    category: "Team",
+    description: "A Paving section for parking lots and driveways: the takeoff, estimate, proposal, schedule and invoice in one place.",
+    auth: "builtin",
+    docs: "https://jobly.com/docs/",
+    available: () => true,
+  },
+  {
+    id: "roofing",
+    name: "Roofing - Jobly",
+    category: "Team",
+    description: "A Roofing section for roof estimates: roof tools on the measuring map, Good, Better and Best packages priced by the square, and a price range to send first.",
+    auth: "builtin",
+    docs: "https://jobly.com/docs/",
+    available: () => true,
+  },
+  {
+    id: "snow",
+    name: "Snow - Jobly",
+    category: "Team",
+    description: "Snow customers with the inches that call for each, and their crews told the day before when the forecast reaches it.",
+    auth: "builtin",
+    docs: "https://jobly.com/docs/",
+    available: () => true,
+  },
+  {
+    id: "google_business",
+    name: "Google Business Profile",
+    category: "Marketing",
+    description: "Bring your Google reviews into Marketing → Reviews: your rating and trend, replies with a suggestion to start from, and no more review asks to clients who already left one.",
+    auth: "oauth",
+    // Google's prerequisites until Jobly's own page for it is written (docs/marketing-plan.md).
+    docs: "https://jobly.com/docs/connections/google-business-profile/",
+    available: (env) => Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET),
+    appKeys: true,
+  },
+  {
+    id: "meta",
+    name: "Facebook & Instagram",
+    category: "Marketing",
+    description: "Post job photos and 4 and 5-star reviews to your Facebook Page and Instagram, with your own Meta app.",
+    auth: "oauth",
+    docs: "https://jobly.com/docs/connections/facebook-and-instagram/",
+    // Each business makes its own Meta app: nothing to set up on the server, and nothing it can offer.
+    available: () => false,
+    appKeys: true,
+  },
+  {
+    id: "google_calendar",
+    name: "Google Calendar",
+    category: "Calendar",
+    description: "Show your Google calendars on the schedule, and put visits on a Google calendar that stays up to date.",
+    auth: "oauth",
+    docs: "https://developers.google.com/calendar/api",
+    available: (env) => Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET),
+  },
+  {
+    id: "zoho_calendar",
+    name: "Zoho Calendar",
+    category: "Calendar",
+    description: "Show Zoho calendars on the schedule from their private ICS link.",
+    auth: "link",
+    docs: "https://www.zoho.com/calendar/",
+    available: () => true,
+  },
+  {
+    id: "outlook_calendar",
+    name: "Outlook",
+    category: "Calendar",
+    description: "Show Outlook and Microsoft 365 calendars on the schedule from their published ICS link.",
+    auth: "link",
+    docs: "https://outlook.office.com/calendar/",
+    available: () => true,
+  },
+  {
+    id: "apple_calendar",
+    name: "Apple Calendar",
+    category: "Calendar",
+    description: "Show iCloud calendars on the schedule from their public calendar link.",
+    auth: "link",
+    docs: "https://www.icloud.com/calendar/",
+    available: () => true,
+  },
+  {
+    id: "ics_calendar",
+    name: "Other calendars",
+    category: "Calendar",
+    description: "Any calendar with an ICS or webcal link: Yahoo, Fastmail, Proton, Nextcloud, booking tools and more.",
+    auth: "link",
+    docs: "https://en.wikipedia.org/wiki/ICalendar",
+    available: () => true,
+  },
+  {
+    id: "anthropic",
+    name: "Claude",
+    category: "AI",
+    description: "Power Jobly's writing help, SOP answers and receipt reading with your own Anthropic key.",
+    auth: "api_key",
+    docs: "https://docs.claude.com/",
+    available: () => true,
+  },
+  {
+    id: "open_meteo",
+    // Named for what it's for: non-commercial use of Open-Meteo is built in and needs no app.
+    name: "Open-Meteo (commercial)",
+    category: "Weather",
+    description: "For commercial use: forecasts for weather holds and Snow from Open-Meteo's paid service, with your own key. Non-commercial use is included in Jobly.",
+    auth: "api_key",
+    docs: "https://jobly.com/docs/",
+    available: () => true,
+  },
+  {
+    id: "fal",
+    name: "fal.ai",
+    category: "AI",
+    description: "Find paving on the aerial in one tap: asphalt, concrete and stalls outlined for you, with your own fal.ai account.",
+    auth: "api_key",
+    docs: "https://jobly.com/docs/connections/fal/",
+    available: () => true,
+  },
+  {
+    id: "chatgpt",
+    name: "ChatGPT",
+    category: "AI",
+    description: "Power Jobly's writing help, SOP answers and receipt reading with your own OpenAI key or ChatGPT plan.",
+    auth: "api_key",
+    docs: "https://platform.openai.com/docs/",
+    available: () => true,
+  },
+  {
+    id: "quickbooks",
+    name: "QuickBooks Online",
+    category: "Accounting",
+    description: "Send clients, invoices and payments to QuickBooks when it's your book of record.",
+    auth: "oauth",
+    docs: "https://jobly.com/docs/connections/quickbooks/",
+    available: (env) => Boolean(env.QUICKBOOKS_CLIENT_ID && env.QUICKBOOKS_CLIENT_SECRET),
+    appKeys: true,
+  },
+  {
+    id: "zoho_books",
+    name: "Zoho Books",
+    category: "Accounting",
+    description: "Send clients, invoices and payments to Zoho Books in your data center.",
+    auth: "oauth",
+    docs: "https://jobly.com/docs/connections/zoho-books/",
+    available: (env) => Boolean(env.ZOHO_CLIENT_ID && env.ZOHO_CLIENT_SECRET),
+    appKeys: true,
+  },
+  {
+    id: "stripe",
+    name: "Stripe",
+    category: "Payments",
+    description: "Invoices go to Stripe and clients pay by card or bank. Invoices you make in Stripe come in too, with the fees and deposits behind every payment.",
+    auth: "api_key",
+    docs: "https://docs.stripe.com/keys",
+    // A company adds its own key; a deployment can also set one for everyone.
+    available: () => true,
+  },
+  {
+    id: "abc_supply",
+    name: "ABC Supply",
+    category: "Pricing",
+    description: "Your own ABC Supply prices on your estimates: every bundle, roll and piece priced at your branch, so material costs are exact.",
+    auth: "api_key",
+    docs: "https://jobly.com/docs/connections/abc-supply/",
+    // Each business uses its own app at ABC (its Client ID and secret), so nothing to set up on the server.
+    available: () => true,
+  },
+  {
+    id: "twilio",
+    name: "Twilio",
+    category: "Messaging",
+    description: "Text messages: reminders, on-my-way texts and two-way conversations.",
+    auth: "api_key",
+    docs: "https://www.twilio.com/docs/messaging",
+    // A company connects its own Twilio account (its Account SID, Auth Token and number: lib/twilio.ts);
+    // a deployment can also set one for everyone.
+    available: () => true,
+  },
+  {
+    id: "lob",
+    name: "Lob",
+    category: "Marketing",
+    description: "Postcards printed and mailed for your campaigns, through your own Lob account.",
+    auth: "api_key",
+    docs: "https://docs.lob.com/",
+    // Each business uses its own Lob account and key, so nothing to set up on the server.
+    available: () => true,
+  },
+  {
+    id: "sveltia",
+    name: "Sveltia CMS",
+    category: "Website",
+    description: "Edit your website's pages and posts from Jobly, in the Sveltia CMS editor your site already has.",
+    auth: "site",
+    docs: "https://jobly.com/docs/connections/sveltia-cms/",
+    available: () => true,
+  },
+];
+
+export function catalogEntry(id: string): CatalogEntry | undefined {
+  return CATALOG.find((entry) => entry.id === id);
+}
+
+export const isCalendarApp = (id: string): id is CalendarApp => (CALENDAR_APPS as readonly string[]).includes(id);
+
+/** Context passed back on the OAuth callback (Zoho tells us which data center the account lives in). */
+export interface CallbackContext {
+  query: Record<string, string>;
+}
+
+export interface OAuthConfig {
+  authorizeUrl: (env: Env, saved?: Record<string, string>) => string;
+  tokenUrl: (env: Env, ctx?: CallbackContext, saved?: Record<string, string>) => string;
+  revokeUrl?: (env: Env, saved?: Record<string, string>) => string;
+  scope: string;
+  clientId: (env: Env) => string | undefined;
+  clientSecret: (env: Env) => string | undefined;
+  /** "basic": client credentials in an Authorization header; "body": in the form body. */
+  clientAuth: "basic" | "body";
+  extraParams?: Record<string, string>;
+}
+
+export class IntegrationError extends Error {
+  override name = "IntegrationError";
+}
+
+/** A provider pointed us at a server that isn't its own. The message is shown on the Apps page. */
+export class UntrustedServerError extends IntegrationError {}
+
+/** Provider calls give up after this long, so a provider that hangs fails like one that's down. */
+export const providerTimeout = () => AbortSignal.timeout(15_000);
+
+// Zoho's data centers: US, EU, India, Australia, Japan, China, Canada, Saudi Arabia, UK.
+const ZOHO_TLDS = ["com", "eu", "in", "com.au", "jp", "com.cn", "ca", "sa", "uk"];
+const ZOHO_ACCOUNTS = new Set([...ZOHO_TLDS.map((tld) => `accounts.zoho.${tld}`), "accounts.zohocloud.ca"]);
+const ZOHO_APIS = new Set(ZOHO_TLDS.flatMap((tld) => [`www.zohoapis.${tld}`, `zohoapis.${tld}`]));
+
+/** The origin of an https URL on one of `hosts` (default port, no user info), or null. */
+function trustedOrigin(value: string, hosts: Set<string>): string | null {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.port || url.username || url.password || !hosts.has(url.hostname)) return null;
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The accounts server Zoho's callback names (?accounts-server=). It arrives in the browser's URL
+ * and the client secret is sent there, so only Zoho's own accounts servers are accepted.
+ */
+export function zohoAccountsServer(value: string): string {
+  const origin = trustedOrigin(value, ZOHO_ACCOUNTS);
+  if (!origin) throw new UntrustedServerError("That sign-in came back from a server that isn't Zoho's, so Zoho Books wasn't connected. Try connecting again.");
+  return origin;
+}
+
+/** The API domain from Zoho's token response: only Zoho's own API servers (zohoapis.*) are used. */
+export function zohoApiDomain(value: string | undefined): string {
+  if (!value) return "https://www.zohoapis.com";
+  const origin = trustedOrigin(value, ZOHO_APIS);
+  if (!origin) throw new UntrustedServerError("Zoho gave an API address that isn't one of Zoho's servers, so it wasn't used. Connect Zoho Books again.");
+  return origin;
+}
+
+const zohoAccounts = (env: Env, saved?: Record<string, string>) =>
+  saved?.accounts_server ? zohoAccountsServer(saved.accounts_server) : (env.ZOHO_ACCOUNTS_URL ?? "https://accounts.zoho.com").replace(/\/$/, "");
+
+export const OAUTH: Partial<Record<Provider, OAuthConfig>> = {
+  quickbooks: {
+    authorizeUrl: () => "https://appcenter.intuit.com/connect/oauth2",
+    tokenUrl: () => "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
+    revokeUrl: () => "https://developer.api.intuit.com/v2/oauth2/tokens/revoke",
+    scope: "com.intuit.quickbooks.accounting",
+    clientId: (env) => env.QUICKBOOKS_CLIENT_ID,
+    clientSecret: (env) => env.QUICKBOOKS_CLIENT_SECRET,
+    clientAuth: "basic",
+  },
+  zoho_books: {
+    // A company's own Zoho app lives in its own data center, so sign-in starts there.
+    authorizeUrl: (env, saved) => `${zohoAccounts(env, saved)}/oauth/v2/auth`,
+    // Zoho's callback says which data center the account is in; tokens must come from there.
+    tokenUrl: (env, ctx, saved) => `${ctx?.query["accounts-server"] ? zohoAccountsServer(ctx.query["accounts-server"]) : zohoAccounts(env, saved)}/oauth/v2/token`,
+    revokeUrl: (env, saved) => `${zohoAccounts(env, saved)}/oauth/v2/token/revoke`,
+    scope: "ZohoBooks.fullaccess.all",
+    clientId: (env) => env.ZOHO_CLIENT_ID,
+    clientSecret: (env) => env.ZOHO_CLIENT_SECRET,
+    clientAuth: "body",
+    extraParams: { access_type: "offline", prompt: "consent" },
+  },
+  google_calendar: {
+    authorizeUrl: () => "https://accounts.google.com/o/oauth2/v2/auth",
+    tokenUrl: () => "https://oauth2.googleapis.com/token",
+    revokeUrl: () => "https://oauth2.googleapis.com/revoke",
+    // As little as the features need: see which calendars there are, read their events, and keep
+    // the one calendar Jobly makes for visits. Never change anyone's own events.
+    scope: [
+      "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+      "https://www.googleapis.com/auth/calendar.events.readonly",
+      "https://www.googleapis.com/auth/calendar.app.created",
+    ].join(" "),
+    clientId: (env) => env.GOOGLE_CLIENT_ID,
+    clientSecret: (env) => env.GOOGLE_CLIENT_SECRET,
+    clientAuth: "body",
+    extraParams: { access_type: "offline", prompt: "consent" },
+  },
+  google_business: {
+    authorizeUrl: () => "https://accounts.google.com/o/oauth2/v2/auth",
+    tokenUrl: () => "https://oauth2.googleapis.com/token",
+    revokeUrl: () => "https://oauth2.googleapis.com/revoke",
+    // The one scope the Business Profile APIs take: see the locations and their reviews, and reply.
+    scope: "https://www.googleapis.com/auth/business.manage",
+    clientId: (env) => env.GOOGLE_CLIENT_ID,
+    clientSecret: (env) => env.GOOGLE_CLIENT_SECRET,
+    clientAuth: "body",
+    // Google's account chooser every time: the account that manages the Business Profile is often
+    // not the one signed in to the browser, and Reconnect is how someone picks another.
+    extraParams: { access_type: "offline", prompt: "select_account consent" },
+  },
+  meta: {
+    // Signing in, the token and revoking are integrations/meta.ts's: these are for /connect.
+    authorizeUrl: () => `${DIALOG}/${GRAPH_VERSION}/dialog/oauth`,
+    tokenUrl: () => `https://graph.facebook.com/${GRAPH_VERSION}/oauth/access_token`,
+    scope: META_SCOPES.join(","),
+    clientId: () => undefined,
+    clientSecret: () => undefined,
+    clientAuth: "body",
+  },
+};

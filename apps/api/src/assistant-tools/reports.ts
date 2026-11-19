@@ -1,0 +1,187 @@
+/**
+ * The business's figures, as the Finance page and the home dashboard show them: the same rows and
+ * the same sums (packages/core/src/reports.ts), for the same people. The database hides money from
+ * roles without it; who sees reports at all (owners, admins and office staff with "Finance and
+ * metrics") and job costs is checked here, as the Finance page checks it.
+ */
+import { breakPay, jobProfit, localDate, moneyFigures, previousRange, REPORT_PRESETS, resolveRange, salesFigures, serviceFigures, teamHours, type ReportPreset, type ReportRange } from "@jobly/core";
+import { z } from "zod";
+import { adminClient } from "../lib/supabase";
+import { timeRates } from "../services/payRates";
+import { companyArg, friendly, requireRole, roleAllows, rows, tool, type ToolContext } from "./tool";
+
+const OFFICE = ["owner", "admin", "office"] as const;
+const rangeInput = {
+  range: z.enum(REPORT_PRESETS.map((p) => p.key) as [ReportPreset, ...ReportPreset[]]).default("month").describe("month, last_month, 30d, 90d, quarter, year, last_year, or custom with from and to."),
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+};
+
+function rangeOf(ctx: ToolContext, a: { range: ReportPreset; from?: string; to?: string }) {
+  const custom = a.from || a.to ? "custom" : a.range;
+  return resolveRange(custom, localDate(new Date(), ctx.timezone), ctx.timezone, { from: a.from, to: a.to });
+}
+
+/** Up to 25,000 rows, a page at a time, as the Finance page reads them. */
+async function all<T>(page: (from: number, to: number) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>): Promise<T[]> {
+  const out: T[] = [];
+  for (let i = 0; i < 25; i++) {
+    const batch = await rows(page(i * 1000, i * 1000 + 999));
+    out.push(...batch);
+    if (batch.length < 1000) break;
+  }
+  return out;
+}
+
+async function teamNames(ctx: ToolContext) {
+  const members = await rows(ctx.db.from("memberships").select("user_id").eq("company_id", ctx.companyId));
+  const profiles = members.length ? await rows(ctx.db.from("profiles").select("user_id, full_name").in("user_id", members.map((m) => m.user_id))) : [];
+  const names = new Map(profiles.map((p) => [p.user_id, p.full_name]));
+  return (id: string | null) => (id ? (names.get(id) ?? "Former team member") : "Unassigned");
+}
+
+const SERVICE_LINES = "service_id, name, quantity, unit_price, invoice:invoices!inner(id, job_id, kind, status, issued_on, discount_amount, credit_amount)";
+
+/** Revenue by price list item, and with job costs each one's costs and profit, as Finance → Services works them out. */
+async function serviceReport(ctx: ToolContext, range: ReportRange) {
+  // serviceFigures leaves out drafts, voids and part billings too; this just reads fewer rows.
+  const lines = () => ctx.db.from("invoice_line_items").select(SERVICE_LINES).eq("company_id", ctx.companyId).not("invoice.status", "in", "(draft,void)").not("invoice.kind", "in", "(deposit,progress,retainage)");
+  const [sold, items] = await Promise.all([
+    all((f, t) => lines().gte("invoice.issued_on", range.from).lte("invoice.issued_on", range.to).order("id").range(f, t)),
+    all((f, t) => ctx.db.from("services").select("id, name, category, unit_cost, labor_cost").eq("company_id", ctx.companyId).order("id").range(f, t)),
+  ]);
+  if (!roleAllows(ctx, OFFICE, "job_costs")) {
+    const figures = serviceFigures(sold, items);
+    return { revenue: figures.revenue, services: figures.services.map(({ service_id, name, category, count, quantity, revenue }) => ({ service_id, name, category, count, quantity, revenue })) };
+  }
+  // 200 jobs a request keeps the address short enough.
+  const ids = [...new Set(sold.flatMap((l) => (l.invoice?.job_id ? [l.invoice.job_id] : [])))];
+  const byJobs = async <T>(read: (jobs: string[]) => PromiseLike<T[]>) => (await Promise.all(Array.from({ length: Math.ceil(ids.length / 200) }, (_, i) => read(ids.slice(i * 200, i * 200 + 200))))).flat();
+  const [jobLines, time, expenses, rates, crewPay, costLines, materials] = await Promise.all([
+    // Everything the jobs have been invoiced, whenever: their labor is split across all of it.
+    byJobs((jobs) => all((f, t) => lines().in("invoice.job_id", jobs).order("id").range(f, t))),
+    byJobs((jobs) => all((f, t) => ctx.db.from("time_entries").select("id, job_id, started_at, ended_at").in("job_id", jobs).order("id").range(f, t))),
+    // As Finance → Services reads them: an expense already in the line items' costs isn't counted again.
+    byJobs((jobs) => all((f, t) => ctx.db.from("expenses").select("job_id, amount, in_line_costs").in("job_id", jobs).order("id").range(f, t))),
+    byJobs((jobs) => timeRates(adminClient(ctx.env), ctx.companyId, { job_ids: jobs }).then((r) => [r])).then((r): Record<string, number> => Object.assign({}, ...r)),
+    byJobs((jobs) => rows(ctx.db.rpc("job_pay_costs", { p_jobs: jobs }))),
+    // The jobs' own lines and what was logged on them: logged materials over or under the estimate count as they do in Finance.
+    byJobs((jobs) => all((f, t) => ctx.db.from("job_line_items").select("job_id, quantity, unit_cost, unit_labor_cost, service_id, unit, parts").in("job_id", jobs).order("id").range(f, t))),
+    byJobs((jobs) => all((f, t) => ctx.db.from("job_materials").select("job_id, service_id, name, unit, quantity").in("job_id", jobs).order("id").range(f, t))),
+  ]);
+  const { lines: _, ...figures } = serviceFigures(sold, items, { jobLines, time, expenses, rateOf: (e) => rates[e.id] ?? 0, crewPay, costLines, materials });
+  return { ...figures, costs: "Each item's price list cost (without the labor in it once the job has labor of its own), plus a share of the job's labor (time at its rates, sub and crew pay) and expenses, split by the line's share of everything the job has been invoiced." };
+}
+
+export const reportTools = {
+  business_summary: tool({
+    description: "Today at a glance, as the home screen shows it: requests, quotes and jobs waiting, today's visits, what's owed (and by whom), this month's collected, invoiced and quotes won, and what needs attention. Money only if your role sees it.",
+    input: z.object({ ...companyArg }),
+    run: async (ctx) => {
+      const { data, error } = await ctx.db.rpc("dashboard", { p_company: ctx.companyId }, { get: true });
+      if (error) throw new Error(friendly(error.message));
+      return data;
+    },
+  }),
+  money_report: tool({
+    description:
+      "Money for a period (default this month): invoiced, collected (and vs the period before), tips, card fees, sales tax billed, what's owed and past due now, unpaid invoices by age, payments by method, and each client's balance. With by_service, also revenue by price list item: invoices issued in the period, paid or not (not drafts or voided), before tax and after discounts and credits; deposits and progress billing count when the final invoice lists the work; lines not from the price list are Other. With job costs, each item's costs, profit and margin too.",
+    input: z.object({ ...rangeInput, by_service: z.boolean().default(false).describe("Also revenue (and, if your role sees job costs, profit) by service."), ...companyArg }),
+    run: async (ctx, a) => {
+      requireRole(ctx, OFFICE, "reports");
+      requireRole(ctx, undefined, "invoices");
+      const range = rangeOf(ctx, a);
+      const before = previousRange(range);
+      const today = localDate(new Date(), ctx.timezone);
+      const [invoices, payments, open, paidBefore, invoicedBefore] = await Promise.all([
+        all((f, t) => ctx.db.from("invoices").select("total, tax_amount, issued_on").eq("company_id", ctx.companyId).not("status", "in", "(draft,void)").gte("issued_on", range.from).lte("issued_on", range.to).range(f, t)),
+        all((f, t) => ctx.db.from("payments").select("amount, tip_amount, fee_amount, method, received_at").eq("company_id", ctx.companyId).gte("received_at", range.start).lt("received_at", range.end).range(f, t)),
+        all((f, t) => ctx.db.from("invoices").select("balance_due, due_on, client:clients(id, display_name)").eq("company_id", ctx.companyId).in("status", ["sent", "partially_paid", "overdue"]).range(f, t)),
+        all((f, t) => ctx.db.from("payments").select("amount").eq("company_id", ctx.companyId).gte("received_at", before.start).lt("received_at", before.end).range(f, t)),
+        all((f, t) => ctx.db.from("invoices").select("total").eq("company_id", ctx.companyId).not("status", "in", "(draft,void)").gte("issued_on", before.from).lte("issued_on", before.to).range(f, t)),
+      ]);
+      const figures = moneyFigures({ invoices, payments, open: open as never }, today);
+      const total = (r: Array<{ amount?: unknown; total?: unknown }>) => Math.round(r.reduce((s, x) => s + Number(x.amount ?? x.total ?? 0), 0) * 100) / 100;
+      return {
+        period: range,
+        ...figures,
+        collected_previous_period: total(paidBefore),
+        invoiced_previous_period: total(invoicedBefore),
+        client_balances: figures.client_balances.slice(0, 50),
+        ...(a.by_service ? { by_service: await serviceReport(ctx, range) } : {}),
+      };
+    },
+  }),
+  sales_report: tool({
+    description: "Quotes sent in a period (default this month): won, lost and still waiting, conversion, average quote, days to approval, by salesperson and lead source, and why quotes were lost.",
+    input: z.object({ ...rangeInput, ...companyArg }),
+    run: async (ctx, a) => {
+      requireRole(ctx, OFFICE, "reports");
+      const range = rangeOf(ctx, a);
+      const [quotes, clients, nameOf] = await Promise.all([
+        all((f, t) => ctx.db.from("quotes").select("id, status, total, sent_at, approved_at, salesperson_id, created_by, lost_reason, client:clients(lead_source)").eq("company_id", ctx.companyId).gte("sent_at", range.start).lt("sent_at", range.end).range(f, t)),
+        all((f, t) => ctx.db.from("clients").select("id, lead_source").eq("company_id", ctx.companyId).gte("created_at", range.start).lt("created_at", range.end).range(f, t)),
+        teamNames(ctx),
+      ]);
+      return { period: range, ...salesFigures({ quotes: quotes as never, clients }, nameOf) };
+    },
+  }),
+  job_profit: tool({
+    description: "Profit on jobs finished in a period (default this month): each job's revenue, labor (approved time at its rate, the rest at the person's current rate), sub and crew pay (agreed, done or paid), expenses and materials at cost (without the labor estimate in a line's cost once the job has labor of its own), profit and margin, and which are below the company's target margin. As on the job page, a material logged against one of the job's lines counts at the amount logged in place of the line's estimate (logged_materials_adjustment is the difference), and an expense marked as already in the line items' costs isn't counted again (expenses_in_line_costs).",
+    input: z.object({ ...rangeInput, limit: z.number().int().min(1).max(300).default(100), ...companyArg }),
+    run: async (ctx, a) => {
+      requireRole(ctx, OFFICE, "reports");
+      requireRole(ctx, undefined, "job_costs");
+      const range = rangeOf(ctx, a);
+      const jobs = await all((f, t) =>
+        ctx.db
+          .from("jobs")
+          .select("id, number, title, status, financials:job_financials(contract_total), client:clients(display_name), lines:job_line_items(quantity, unit_cost, unit_labor_cost, service_id, unit, parts)")
+          .eq("company_id", ctx.companyId)
+          .in("status", ["requires_invoicing", "completed"])
+          .gte("updated_at", range.start)
+          .lt("updated_at", range.end)
+          .range(f, t),
+      );
+      const ids = jobs.slice(0, a.limit).map((j) => j.id);
+      const [time, expenses, rates, company, crewPay, materials] = ids.length
+        ? await Promise.all([
+            all((f, t) => ctx.db.from("time_entries").select("id, job_id, user_id, started_at, ended_at, approved_at").in("job_id", ids).range(f, t)),
+            all((f, t) => ctx.db.from("expenses").select("job_id, amount, in_line_costs").in("job_id", ids).range(f, t)),
+            timeRates(adminClient(ctx.env), ctx.companyId, { job_ids: ids }),
+            rows(ctx.db.from("companies").select("settings").eq("id", ctx.companyId)),
+            // Sub and crew pay (job pay agreed, done or paid), for the office with job costs.
+            rows(ctx.db.rpc("job_pay_costs", { p_jobs: ids })),
+            // Materials logged on the jobs, to count in place of the lines' estimate for them.
+            all((f, t) => ctx.db.from("job_materials").select("job_id, service_id, name, unit, quantity").in("job_id", ids).order("id").range(f, t)),
+          ])
+        : [[], [], {} as Record<string, number>, [], [], []];
+      const target = Number(((company[0]?.settings ?? {}) as Record<string, unknown>).margin_target ?? 0) || null;
+      const result = jobProfit(jobs.slice(0, a.limit) as never, time, expenses, (e) => rates[e.id] ?? 0, target, crewPay, materials);
+      return { period: range, ...result, jobs: result.jobs.sort((x, y) => (x.margin_percent ?? 0) - (y.margin_percent ?? 0)) };
+    },
+  }),
+  team_hours_report: tool({
+    description: "Time tracked in a period (default this month): paid hours by person and category (breaks count as the company pays them; unpaid break time is listed apart), share on visits, hours waiting for approval, and labor cost (if your role sees job costs).",
+    input: z.object({ ...rangeInput, ...companyArg }),
+    run: async (ctx, a) => {
+      requireRole(ctx, OFFICE, "reports");
+      const range = rangeOf(ctx, a);
+      const costs = roleAllows(ctx, OFFICE, "job_costs");
+      const [entries, nameOf, rates, company] = await Promise.all([
+        all((f, t) => ctx.db.from("time_entries").select("id, user_id, job_id, started_at, ended_at, category, approved_at").eq("company_id", ctx.companyId).gte("started_at", range.start).lt("started_at", range.end).range(f, t)),
+        teamNames(ctx),
+        costs ? timeRates(adminClient(ctx.env), ctx.companyId, { from: range.start, to: range.end }) : Promise.resolve({} as Record<string, number>),
+        rows(ctx.db.from("companies").select("settings").eq("id", ctx.companyId)),
+      ]);
+      const now = new Date().toISOString();
+      const result = teamHours(
+        entries.map((e) => ({ ...e, running: !e.ended_at, ended_at: e.ended_at ?? now })),
+        (id) => nameOf(id),
+        (e) => rates[e.id] ?? 0,
+        breakPay(company[0]?.settings),
+      );
+      return costs ? { period: range, ...result } : { period: range, ...result, labor_cost: undefined, by_person: result.by_person.map(({ cost: _, ...p }) => p) };
+    },
+  }),
+};
