@@ -1,0 +1,442 @@
+/**
+ * Startup and identity: load config, restore the Supabase session, then load the user's companies.
+ * No session -> sign-in page. No company yet -> onboarding. An owner or admin of a business that
+ * hasn't agreed to the current license -> agree first. Otherwise children render with
+ * useSession() available and API calls carry the active company.
+ */
+import type { Permission, Role } from "@jobly/core/roles";
+import type { Session as AuthSession } from "@supabase/supabase-js";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Button } from "@/components/ui/Button";
+import { confirm } from "@/components/ui/Confirm";
+import { ShellSkeleton } from "@/components/ui/Skeleton";
+import { EmptyState, ErrorState } from "@/components/ui/States";
+import { LoginPage, SetPasswordPage } from "@/features/auth/LoginPage";
+import { OnboardingPage } from "@/features/auth/OnboardingPage";
+import { FirstRun, SetupGate } from "@/features/setup/SetupPage";
+import { registerFieldActions } from "@/features/field/fieldActions";
+import { TermsPage } from "@/features/legal/License";
+import { RailwaySetupPage } from "@/features/setup/RailwaySetupPage";
+import { api, ApiError, companyFeatures, loadConfig, setActiveCompany, supabase, type AppConfig } from "./api";
+import { setCurrency } from "./format";
+import { followProfile, forgetLanguageAtSignOut } from "./i18n";
+import { forgetOfflineCache, keepQueuedFieldActions, keepsDayOffline, pendingFieldActions, signOutWarning, startOfflineCache } from "./offline";
+import { photosNotSent } from "./offlinePhotos";
+import { setRecentsPerson } from "./recent";
+import { setSessionExpiredHandler } from "./queryClient";
+import { toast } from "./toast";
+import { flushUndos } from "./undo";
+import { t } from "@/lib/i18n";
+
+/**
+ * The active company. A sub gets only its basics (company_basics() in the database): no slug, trade
+ * or address, and settings with just the clock, branding and working hours.
+ */
+export interface Company {
+  id: string;
+  name: string;
+  slug?: string;
+  trade_preset?: string;
+  timezone: string;
+  currency: string;
+  /** The shop's address (Settings → Company). */
+  address?: { line1?: string; city?: string; region?: string; postal_code?: string } | null;
+  phone?: string | null;
+  settings: Record<string, unknown>;
+}
+
+/** The sub a person signs in as, when their level is Subcontractor, and what the office lets them do. */
+export interface SubLogin {
+  id: string;
+  name: string;
+  /** They see the client's phone and email, not just their name. */
+  can_contact_clients: boolean;
+  /** Their own clock, for an office that also wants their hours. */
+  uses_clock: boolean;
+  /**
+   * A sign-in Jobly made for this sub (false: someone's own account, which signs in with its own
+   * password and is told at its own address, as it always has).
+   */
+  own_sign_in?: boolean;
+  /**
+   * For their own sign-in: their record has a number sign-in codes are texted to, and an email (not a
+   * placeholder) codes and notices are emailed to: how they get back in on a new phone, and where
+   * notices go. Never the number or address themselves.
+   */
+  has_phone?: boolean;
+  has_email?: boolean;
+  /** For their own sign-in: the office has a phone for them, which texts go to unless they add their own. */
+  phone_on_file?: boolean;
+}
+
+interface Me {
+  /** locale: the language they chose (en, es), or null to follow this device; missing from a server older than it. */
+  profile: { user_id: string; email: string | null; full_name: string; phone: string | null; color?: string | null; avatar_url?: string | null; locale?: string | null };
+  /** False when every sign-in this person has is a sub's: they can't set up a business with it. */
+  can_create_company?: boolean;
+  memberships: Array<{ role: Role; role_name: string; role_id?: string | null; permissions: Permission[]; company: Company; subcontractor?: SubLogin | null; email_connected?: boolean; sms_connected?: boolean; ai_connected?: boolean; chatgpt_plan?: boolean; fal_connected?: boolean; terms_accepted?: boolean; railway_needed?: boolean }>;
+}
+
+export interface Session {
+  config: AppConfig;
+  userId: string;
+  profile: Me["profile"];
+  companies: Me["memberships"];
+  company: Company;
+  role: Role;
+  /** The role's display name: a custom role ("Foreman") or a built-in one ("Office"). */
+  roleName: string;
+  /** Their custom role (Settings → Roles), if they have one. */
+  roleId: string | null;
+  /** Areas this person's role includes. */
+  permissions: Permission[];
+  /** The sub they sign in as (role "subcontractor"); null for the team. */
+  subcontractor: SubLogin | null;
+  switchCompany: (id: string) => void;
+  /** True once signed out. */
+  signOut: () => Promise<boolean>;
+  refresh: () => Promise<unknown>;
+}
+
+const SessionContext = createContext<Session | null>(null);
+const COMPANY_KEY = "jobly.company";
+
+function storedCompany(): string | null {
+  try {
+    return localStorage.getItem(COMPANY_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function Centered({ children }: { children: ReactNode }) {
+  return (
+    <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", padding: 16, background: "var(--ground)" }}>
+      <div className="card" style={{ width: "min(480px, 100%)" }}>{children}</div>
+    </div>
+  );
+}
+
+/**
+ * A one-time link from an email (invite, password reset, sign-in) opens the app with
+ * ?token_hash=…&type=… (emailAuthLink in apps/api/src/lib/auth.ts), and the app redeems it here, so it
+ * works whatever the Supabase project's Site URL is. Links from Supabase's own mailer arrive with
+ * #access_token=…&type=… instead, and supabase-js signs in from those by itself.
+ */
+const LINK_TYPES = ["invite", "recovery", "magiclink", "signup", "email"] as const;
+const emailLink = (() => {
+  try {
+    const query = new URLSearchParams(window.location.search);
+    const tokenHash = query.get("token_hash");
+    const type = LINK_TYPES.find((t) => t === query.get("type"));
+    return tokenHash && type ? { tokenHash, type, welcome: query.get("welcome") === "1" } : null;
+  } catch {
+    return null;
+  }
+})();
+
+/** Arriving from a password-reset or invitation email (read before Supabase clears the URL). */
+const arrivedVia = (() => {
+  if (emailLink) return emailLink.welcome || emailLink.type === "invite" ? "invite" : emailLink.type === "recovery" ? "recovery" : null;
+  try {
+    const type = new URLSearchParams(window.location.hash.slice(1)).get("type") ?? new URLSearchParams(window.location.search).get("type");
+    return type === "recovery" || type === "invite" ? type : null;
+  } catch {
+    return null;
+  }
+})();
+
+let redeeming: Promise<string | null> | null = null;
+
+/** Trades the emailed token for a session, once (React runs effects twice in development). Resolves to a problem to show, or null. */
+function redeemEmailLink(): Promise<string | null> {
+  if (!emailLink) return Promise.resolve(null);
+  redeeming ??= supabase()
+    .auth.verifyOtp({ token_hash: emailLink.tokenHash, type: emailLink.type })
+    .then(
+      ({ error }) => (error ? t("That link has expired or was already used. Ask whoever sent it for a new one, or sign in below.") : null),
+      () => t("Couldn't open that link. Check your connection and try again."),
+    )
+    .finally(() => {
+      // The token works once; keep it out of the address bar and history.
+      const url = new URL(window.location.href);
+      for (const key of ["token_hash", "type", "welcome"]) url.searchParams.delete(key);
+      window.history.replaceState(window.history.state, "", url.pathname + url.search + url.hash);
+    });
+  return redeeming;
+}
+
+/** After a password reset (which may follow a lost phone or a leaked password): end every other sign-in, keep this one. */
+const signOutElsewhere = () => supabase().auth.signOut({ scope: "others" }).then(() => undefined, () => undefined);
+
+export function SessionProvider({ children, requireCompany = true }: { children: ReactNode; requireCompany?: boolean }) {
+  const queryClient = useQueryClient();
+  // Runs with no signal too: loadConfig falls back to the settings saved last time.
+  const config = useQuery({ queryKey: ["config"], queryFn: loadConfig, staleTime: Infinity, retry: 2, networkMode: "always", meta: { silent: true } });
+  const [auth, setAuth] = useState<AuthSession | null | undefined>(undefined);
+  const [companyId, setCompanyId] = useState<string | null>(storedCompany);
+  const [settingPassword, setSettingPassword] = useState<"recovery" | "invite" | null>(arrivedVia);
+  const [linkProblem, setLinkProblem] = useState<string | null>(null);
+  /** The person chose to sign out (rather than the app signing them out). */
+  const signingOut = useRef(false);
+
+  useEffect(() => {
+    if (!config.data) return;
+    const client = supabase();
+    let lastUser: string | null = null;
+    redeemEmailLink()
+      .then((problem) => {
+        setLinkProblem(problem);
+        return client.auth.getSession();
+      })
+      .then(({ data, error }) => {
+        // No signal and the sign-in needs refreshing: keep going with the saved one (refreshed once
+        // the connection is back) rather than sending the crew to the sign-in page.
+        const session = data.session ?? (error && !navigator.onLine ? savedSession() : null);
+        lastUser = session?.user.id ?? null;
+        setAuth(session);
+        // An expired reset or invite link leaves no session: just show sign-in.
+        if (!session) setSettingPassword(null);
+      });
+    const { data } = client.auth.onAuthStateChange((event, session) => {
+      setAuth(session);
+      if (session) lastUser = session.user.id;
+      // A re-sent invite arrives as a recovery link; keep the "set your password" wording.
+      if (event === "PASSWORD_RECOVERY") setSettingPassword((current) => current ?? "recovery");
+      if (event === "SIGNED_OUT") {
+        // Signing out on purpose leaves nothing of theirs on the phone (it may be shared). Signed out
+        // by the app (the sign-in expired, or couldn't be refreshed on a flaky connection), their
+        // unsent field actions stay, and go out when they sign back in.
+        if (lastUser && signingOut.current) forgetOfflineCache(lastUser);
+        else if (lastUser) keepQueuedFieldActions(queryClient, lastUser);
+        signingOut.current = false;
+        lastUser = null;
+        queryClient.clear();
+        // Their language leaves with them: the next person to sign in here never gets it unasked (lib/i18n.tsx).
+        forgetLanguageAtSignOut();
+      }
+    });
+    return () => data.subscription.unsubscribe();
+  }, [config.data, queryClient]);
+
+  useEffect(() => {
+    setSessionExpiredHandler(() => {
+      supabase().auth.signOut().catch(() => undefined);
+    });
+  }, []);
+
+  const me = useQuery({
+    queryKey: ["me", auth?.user.id],
+    queryFn: async () => {
+      const key = `jobly.me.${auth!.user.id}`;
+      try {
+        const fresh = await api.get<Me>("/me");
+        try {
+          localStorage.setItem(key, JSON.stringify(fresh));
+        } catch {
+          // Storage full or private mode.
+        }
+        return fresh;
+      } catch (error) {
+        // No signal: who I am and my companies, from last time.
+        const saved = error instanceof ApiError && error.status === 0 ? localStorage.getItem(key) : null;
+        if (saved) return JSON.parse(saved) as Me;
+        throw error;
+      }
+    },
+    networkMode: "always",
+    enabled: Boolean(auth),
+    staleTime: 5 * 60_000,
+    meta: { silent: true },
+  });
+
+  const membership = me.data?.memberships.find((m) => m.company.id === companyId) ?? me.data?.memberships[0];
+  setActiveCompany(membership?.company.id ?? null);
+  setRecentsPerson(auth?.user.id ?? null);
+  setCurrency(membership?.company.currency);
+
+  // Their own language, once known: the app reloads into it when this device was in another, and a
+  // language picked on the sign-in page is saved with them, so their notifications come in it too
+  // (lib/i18n.tsx). Never the language someone else left on the device.
+  const hasMe = Boolean(me.data);
+  const profileLocale = me.data?.profile.locale;
+  const refetchMe = me.refetch;
+  useEffect(() => {
+    if (!hasMe) return;
+    void followProfile(profileLocale, async (locale) => {
+      await api.patch("/me", { locale });
+      await refetchMe();
+    });
+  }, [hasMe, profileLocale, refetchMe]);
+
+  // Crews and subs keep their day on the phone; queued field actions survive closing the app (lib/offline.ts).
+  const userId = auth?.user.id;
+  const role = membership?.role;
+  // Screens wait for the saved data, so it's in place before they start loading their own.
+  const [cacheFor, setCacheFor] = useState<string | null>(null);
+  useEffect(() => {
+    if (!userId || !role) return;
+    // In this order: startOfflineCache adds its retry rules to the defaults registered here.
+    registerFieldActions(queryClient);
+    const stop = startOfflineCache(queryClient, userId, keepsDayOffline(role));
+    setCacheFor(userId);
+    return () => {
+      stop();
+      setCacheFor(null);
+    };
+  }, [userId, role, queryClient]);
+
+  const switchCompany = useCallback(
+    (id: string) => {
+      try {
+        localStorage.setItem(COMPANY_KEY, id);
+      } catch {
+        // Private mode: the choice just won't survive a reload.
+      }
+      setCompanyId(id);
+      setActiveCompany(id);
+      queryClient.removeQueries({ predicate: (q) => !["config", "me"].includes(String(q.queryKey[0])) });
+    },
+    [queryClient],
+  );
+
+  /**
+   * Signing out on purpose, from the menu or a screen before the app (the license, setting up a
+   * business, choosing a password), clears everything of theirs from this phone, so first say if
+   * field actions are still waiting to send.
+   */
+  const signOut = useCallback(async () => {
+    const warning = signOutWarning(pendingFieldActions(queryClient), userId ? photosNotSent(userId) : 0);
+    const ok =
+      !warning ||
+      (await confirm({
+        ...warning,
+        confirmLabel: t("Sign out anyway"),
+        danger: true,
+      }));
+    if (!ok) return false;
+    // A delete still showing its Undo goes through now, while the person is still signed in.
+    await flushUndos();
+    signingOut.current = true;
+    await supabase().auth.signOut().catch(() => undefined);
+    // Still set: no SIGNED_OUT came (the sign-in needed refreshing and that didn't get through).
+    const signedOut = !signingOut.current;
+    if (!signedOut) toast.error(t("Couldn't sign out. Try again when you have signal."));
+    signingOut.current = false;
+    return signedOut;
+  }, [queryClient, userId]);
+
+  const value = useMemo<Session | null>(() => {
+    if (!config.data || !auth || !me.data || !membership || cacheFor !== auth.user.id) return null;
+    return {
+      config: { ...config.data, features: companyFeatures(config.data.features, membership) },
+      userId: auth.user.id,
+      profile: me.data.profile,
+      companies: me.data.memberships,
+      company: membership.company,
+      role: membership.role,
+      roleName: membership.role_name,
+      roleId: membership.role_id ?? null,
+      permissions: membership.permissions ?? [],
+      subcontractor: membership.role === "subcontractor" ? membership.subcontractor ?? null : null,
+      switchCompany,
+      signOut,
+      refresh: () => me.refetch(),
+    };
+  }, [config.data, auth, me, membership, switchCompany, signOut, cacheFor]);
+
+  // Errors before anyone can use the app are usually unfinished setup: SetupGate shows the steps instead.
+  if (config.error) {
+    return (
+      <SetupGate>
+        <Centered>
+          <ErrorState title={t("Can't reach Jobly")} error={config.error} onRetry={() => config.refetch()} />
+        </Centered>
+      </SetupGate>
+    );
+  }
+  if (!config.data || auth === undefined) return <ShellSkeleton />;
+  if (!auth) {
+    // A one-business instance: setup steps, or the owner's first account, before the sign-in page.
+    return config.data.singleCompany ? <FirstRun><LoginPage notice={linkProblem} /></FirstRun> : <LoginPage notice={linkProblem} />;
+  }
+  if (settingPassword) return <SetPasswordPage kind={settingPassword} onDone={() => setSettingPassword(null)} onSignOut={signOut} onSignOutElsewhere={signOutElsewhere} />;
+  if (me.error) {
+    return (
+      <SetupGate>
+        <Centered>
+          <ErrorState title={t("Couldn't load your account")} error={me.error} onRetry={() => me.refetch()} />
+          <div style={{ display: "flex", justifyContent: "center", paddingBottom: 24, marginTop: -12 }}>
+            <Button variant="ghost" icon="logout" onClick={() => signOut()}>{t("Sign out")}</Button>
+          </div>
+        </Centered>
+      </SetupGate>
+    );
+  }
+  if (!me.data) return <ShellSkeleton />;
+  if (!membership) {
+    // Someone who only ever signed in as a sub, whose sign-in the office took away: not a business to set up.
+    if (requireCompany && me.data.can_create_company === false) {
+      return (
+        <Centered>
+          <EmptyState icon="lock" title={t("Your sign-in is turned off")} action={<Button variant="ghost" icon="logout" onClick={() => signOut()}>{t("Sign out")}</Button>}>
+            {t("The business that gave you this sign-in has turned it off. Ask their office to turn it back on.")}
+          </EmptyState>
+        </Centered>
+      );
+    }
+    return requireCompany ? <OnboardingPage onCreated={() => me.refetch()} onSignOut={signOut} /> : <>{children}</>;
+  }
+  // Only false from the server counts: an account saved for working offline may predate it.
+  if (membership.terms_accepted === false && (membership.role === "owner" || membership.role === "admin")) {
+    return <TermsPage companyName={membership.company.name} onAccepted={() => me.refetch()} onSignOut={signOut} />;
+  }
+  // On Railway the owner connects it first (required: the warnings before Railway stops Jobly
+  // need it), then, just after setting up, may pick a web address (skippable).
+  if (requireCompany && membership.role === "owner" && config.data.platform === "railway" && (membership.railway_needed || membership.company.settings?.railway_setup === "pending")) {
+    return <RailwaySetupPage companyName={membership.company.name} needed={Boolean(membership.railway_needed)} onDone={() => me.refetch()} onSignOut={signOut} />;
+  }
+  if (!value) return <ShellSkeleton />;
+  return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
+}
+
+export function useSession(): Session {
+  const session = useContext(SessionContext);
+  if (!session) throw new Error("useSession must be used inside SessionProvider"); // i18n-ignore: for developers
+  return session;
+}
+
+/** The session where there may be none yet: a screen that needs a sign-in but not a company (AI assistant consent). */
+export const useSessionIfAny = (): Session | null => useContext(SessionContext);
+
+/** Owners can do everything; otherwise check the member's role. */
+export const hasRole = (session: Pick<Session, "role">, ...roles: string[]) => session.role === "owner" || roles.includes(session.role);
+
+/** A subcontractor, signed in for their own visits and paperwork only (docs/subcontractors-plan.md). */
+export const isSub = (session: Pick<Session, "role">) => session.role === "subcontractor";
+
+/** Someone every one of whose sign-ins is a sub's: no team anywhere (an AI assistant isn't for them). */
+export const onlySubs = (companies: ReadonlyArray<{ role: string }> | null | undefined) => Boolean(companies?.length) && companies!.every((m) => m.role === "subcontractor");
+
+/**
+ * Whether this person's own time is kept: everyone on the team, and a sub only when the office
+ * turned on "Uses the clock" for them. Otherwise a sub has no clock, and Start and Complete don't
+ * clock them in or out (the database refuses their time too).
+ */
+export const keepsTime = (session: Pick<Session, "role" | "subcontractor">) => session.role !== "subcontractor" || session.subcontractor?.uses_clock === true;
+
+/** Does this person's role include an area (invoices, reports, marketing...)? */
+export const can = (session: Pick<Session, "role" | "permissions">, permission: Permission) => session.role === "owner" || session.permissions.includes(permission);
+
+/** The sign-in Supabase saved in this browser, for opening the app with no signal. */
+function savedSession(): AuthSession | null {
+  try {
+    const key = Object.keys(localStorage).find((k) => /^sb-.+-auth-token$/.test(k));
+    const parsed = key ? (JSON.parse(localStorage.getItem(key) ?? "null") as (AuthSession & { currentSession?: AuthSession }) | null) : null;
+    const session = parsed?.access_token ? parsed : parsed?.currentSession ?? null;
+    return session?.user ? session : null;
+  } catch {
+    return null;
+  }
+}

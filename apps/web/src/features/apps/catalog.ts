@@ -1,0 +1,819 @@
+/**
+ * What the Apps pages show about each app. How an app connects, and whether this deployment can
+ * offer it, comes from the API (apps/api/src/integrations/registry.ts); the words and pictures
+ * people read live here.
+ */
+import type { WebsiteSite } from "@jobly/core/website";
+import { useQuery } from "@tanstack/react-query";
+import type { IconName } from "@/components/ui/Icon";
+import { api } from "@/lib/api";
+import { can, hasRole, useSession } from "@/lib/session";
+
+export interface AppRow {
+  id: string;
+  name: string;
+  category: "Team" | "Marketing" | "Calendar" | "AI" | "Accounting" | "Payments" | "Pricing" | "Messaging" | "Website" | "Weather";
+  description: string;
+  /**
+   * builtin: part of Jobly, turned on or off here (team chat). site: the website's editor, by its
+   * address (Sveltia CMS). connector: what a server from before Claude's and ChatGPT's pages were
+   * about their keys still calls ChatGPT.
+   */
+  auth: "oauth" | "api_key" | "link" | "connector" | "builtin" | "site";
+  docs: string;
+  available: boolean;
+  redirect_uri: string | null;
+  status: "connected" | "disconnected" | "error";
+  account_label?: string | null;
+  last_sync_at?: string | null;
+  last_error?: string | null;
+  /** Calendar apps: how many calendars were added from this app, and how many have a problem. */
+  calendars?: number;
+  calendar_errors?: number;
+  /**
+   * Stripe only, once it's set up: the company's own key or the server's, and the last import.
+   * autopay and refunds: the company's own key can save and charge cards, and make refunds (false
+   * on the server's key, and on a key made before autopay that needs updating). full_key: the
+   * company's own key is a full secret key, which can also make payouts.
+   */
+  stripe?: { own: boolean; webhook: boolean; livemode: boolean; autopay: boolean; refunds: boolean; full_key: boolean; import: StripeImport | null };
+  /** Stripe only: whether the owners are emailed about Stripe changes (no company email or server sender: the bell only). */
+  owners_emailed?: boolean;
+  /** QuickBooks and Zoho Books: the company can sign in with its own app there (AppKeysCard). */
+  takes_app_keys?: boolean;
+  /** That app's keys, once saved (never the secret). Meta's Configuration ID too, if there is one. */
+  app_keys?: { client_id: string; sandbox: boolean; accounts_server: string | null; config_id?: string | null } | null;
+  /** Sveltia CMS: the website's editor, once its address is added. */
+  website?: WebsiteSite | null;
+  /** ABC Supply, once it's connected: the account and branch prices come from, and the others to pick. */
+  supplier?: SupplierSettings | null;
+  /** Google Business Profile: the location reviews come from and what's in the way (routes/apps.ts). */
+  google_business?: GoogleBusinessState;
+  /** Facebook & Instagram: the Page and Instagram account posts go to, and what's in the way. */
+  meta?: MetaState;
+  /** Twilio: whose account texts go from, and where the number's incoming texts go (routes/apps.ts). */
+  twilio?: TwilioState | null;
+  /** Lob, once connected: whether its key is a test key (nothing mailed) or a live one. */
+  lob?: { mode: "test" | "live" | null } | null;
+  /** ChatGPT, once the company's OpenAI key is saved: the model it uses and the ones to pick from. */
+  openai?: OpenAiState;
+  /** ChatGPT: the person looking has connected their own ChatGPT plan (each person's own). */
+  my_plan?: boolean;
+  /** ChatGPT: the company lets everyone on the team connect their own plan. */
+  team_plans?: boolean;
+}
+
+export interface OpenAiState {
+  model: string | null;
+  models: Array<{ slug: string; display_name: string }>;
+  /** The server sets the model (OPENAI_MODEL), so it isn't picked on the page. */
+  model_locked: boolean;
+}
+
+/** Jobly's own AI: the keys the company added, the one it chose with both, and the service that answers now. */
+export interface AiState {
+  claude: boolean;
+  chatgpt: boolean;
+  choice: "claude" | "chatgpt" | null;
+  /** The server has a Claude key of its own, used by a company with no key. */
+  server: boolean;
+  service: "claude" | "chatgpt" | null;
+}
+
+export interface TwilioState {
+  /** The company connected its own Twilio account; `from_number` is the number texts go from. */
+  own: boolean;
+  /** Texts go from the Twilio account the server was set up with (the company hasn't connected its own). */
+  server: boolean;
+  from_number: string | null;
+  /** The address Twilio sends incoming texts to for this Jobly, and whether the company's number does. */
+  webhook_url: string;
+  webhook_set: boolean;
+  /** Where the number sends incoming texts now, when that's somewhere else. */
+  other_webhook: string | null;
+  /** This Jobly has a public https address, which Twilio needs to reach it. */
+  reachable: boolean;
+}
+
+export interface MetaState {
+  page: { id: string; name: string | null; picture: string | null } | null;
+  instagram: { id: string; username: string | null } | null;
+  /** The Instagram account linked to the Page, whether or not posts go to it. */
+  page_instagram: { id: string; username: string | null } | null;
+  pages: number | null;
+  /** Permissions posting needs that weren't granted. */
+  missing: string[];
+  /** signin (Reconnect), pick (a Page to pick), permissions, or null. */
+  problem: "signin" | "pick" | "permissions" | null;
+  /** A Page in a business portfolio: Instagram needs ads_management and ads_read too. */
+  needs_business_permissions: boolean;
+  live_confirmed_at: string | null;
+  /** When Meta asks for a new sign-in (Unix seconds). */
+  data_access_expires_at: number | null;
+  /** The 60-day sign-in ran out: posting goes on, but changing the Page needs a new sign-in. */
+  user_token_expired: boolean;
+  user_name: string | null;
+  scheduled_posts: number;
+  marketing_on: boolean;
+}
+
+export interface GoogleBusinessState {
+  location: { id: string; title: string | null; address: string | null; maps_uri: string | null } | null;
+  /** The location the reviews here came from, kept from before disconnecting too: picking another removes them. */
+  kept_location?: string | null;
+  /** review_syncs.problem: approval, not_enabled, signin, pick, location or error. */
+  problem: string | null;
+  problem_detail?: string | null;
+  problem_message?: string | null;
+  last_synced_at?: string | null;
+  next_sync_at?: string | null;
+  first_synced_at?: string | null;
+  progress?: { seen: number; total: number | null } | null;
+  /** Reviews brought in and still on Google. */
+  review_count: number;
+  review_url?: { current: string | null; suggested: string | null };
+  /** Signed in with the company's own Google app, which needs Google's approval of its own. */
+  own_app: boolean;
+  /** The Google Cloud project's number, which Google's access form asks for. */
+  project_number: string | null;
+  marketing_on: boolean;
+}
+
+export interface SupplierSettings {
+  environment: "production" | "sandbox";
+  ship_to: string;
+  ship_to_name: string;
+  branch: string;
+  branch_name: string;
+  accounts: Array<{ number: string; name: string; city: string | null; state: string | null; branches: Array<{ number: string; name: string; home: boolean }> }>;
+}
+
+export interface StripeImport {
+  status: "running" | "done" | "failed";
+  since: string | null;
+  started_at: string;
+  finished_at?: string;
+  error?: string;
+  /** Why the saved cards didn't come in, when that pass failed but the rest of the import finished. */
+  cards_error?: string;
+  /**
+   * cards: clients whose card saved in Stripe came in (an import on a key that can save cards).
+   * cards_unmatched: Stripe customers with a card who matched no one client. Older imports have neither.
+   */
+  counts: { invoices: number; payments: number; clients: number; payouts: number; cards?: number; cards_unmatched?: number };
+}
+
+/**
+ * What Jobly's Stripe key may do: add its webhook, customers and invoices (with their items),
+ * read payments, fees, deposits and the account's name, and for autopay save cards and bank
+ * accounts (Checkout in setup mode), charge them and refund payments. Stripe's create-key form sets
+ * these from its link (each name is a row there; balance transactions come under Balance). Stripe
+ * doesn't document that, so the names have to be checked on Stripe's form whenever this list
+ * changes; if one stops working, people still land on the form.
+ */
+export const STRIPE_KEY_PERMISSIONS = [
+  "webhook_write", "customer_write", "invoice_write", "charge_read", "balance_read", "balance_transaction_source_read", "payout_read", "connected_account_read",
+  "setup_intent_write", "payment_method_write", "payment_intent_write", "checkout_session_write", "refund_write",
+];
+/** Under the password that changing Stripe or the company's email asks for: someone who signs in with Google or a link may have none yet. */
+export const PASSWORD_HINT = "To make sure it's you. No password yet? Set one under Settings → Profile.";
+
+/** Stripe's create-key form with the permissions above already set. */
+export const STRIPE_NEW_KEY = `https://dashboard.stripe.com/apikeys/create?name=Jobly&${STRIPE_KEY_PERMISSIONS.map((p) => `permissions%5B%5D=rak_${p}`).join("&")}`;
+
+/** A live full secret key, which can do anything in the Stripe account, payouts included: warned about, but taken. */
+export const isFullSecretKey = (key: string) => key.trim().startsWith("sk_live_");
+
+/** An import that hasn't reported in this long died with its server (IMPORT_STALE_MS on the API). */
+export const importRunning = (state: StripeImport | null | undefined) => state?.status === "running" && Date.now() - Date.parse(state.started_at) < 30 * 60_000;
+
+export interface AppsData {
+  /** The connector's address, which the app pages showed once. Settings → AI assistants shows it now, from the page's own address. */
+  mcp_url: string;
+  /** Not there from a server older than this page. */
+  ai?: AiState;
+  apps: AppRow[];
+}
+
+/**
+ * How often Apps is read again: every 3 seconds while a Stripe import runs, every 5 while Google
+ * reviews are coming in for the first time (the app page's "Bringing in your reviews: 50 of 145",
+ * as the Reviews tab does), and not otherwise.
+ */
+export function appsPollMs(apps: ReadonlyArray<Pick<AppRow, "stripe" | "google_business">> | undefined): number | false {
+  if (apps?.some((a) => importRunning(a.stripe?.import))) return 3000;
+  if (apps?.some((a) => a.google_business?.progress)) return 5000;
+  return false;
+}
+
+/**
+ * Marketing is in this person's menu when it's installed: owners, admins and office staff with the
+ * marketing area. An admin who connects apps without it manages Marketing's apps, but their Open and
+ * Marketing → Reviews links would lead to "no access".
+ */
+export const usesMarketing = (session: Parameters<typeof hasRole>[0] & Parameters<typeof can>[0]) => hasRole(session, "admin", "office") && can(session, "marketing");
+
+/** The Apps list, for owners and admins who can connect apps. */
+export function useApps() {
+  const session = useSession();
+  const allowed = hasRole(session, "admin") && can(session, "apps");
+  const query = useQuery({
+    queryKey: ["apps", session.company.id],
+    enabled: allowed,
+    queryFn: () => api.get<AppsData>("/apps"),
+    // Follow a Stripe import while it runs, and a first sync of Google reviews while they come in.
+    refetchInterval: (q) => appsPollMs(q.state.data?.apps),
+  });
+  return { allowed, ...query };
+}
+
+export const CATEGORY_LABELS: Record<AppRow["category"], string> = {
+  Team: "Built by Jobly",
+  Marketing: "Marketing",
+  Calendar: "Calendars",
+  AI: "AI",
+  Accounting: "Accounting",
+  Payments: "Payments",
+  Pricing: "Material prices",
+  Messaging: "Messaging",
+  Website: "Your website",
+  Weather: "Weather",
+};
+
+/** An app's category on its own page: the built-in ones are simply Jobly's. */
+export const categoryName = (category: AppRow["category"]) => (category === "Team" ? "Jobly" : (CATEGORY_LABELS[category] ?? category));
+
+/** The row of related apps at the bottom of an app's page. */
+export const MORE_LABELS: Record<AppRow["category"], string> = {
+  Team: "More built-in apps",
+  Marketing: "More marketing apps",
+  Calendar: "More calendars",
+  AI: "More AI apps",
+  Accounting: "More accounting apps",
+  Payments: "More payment apps",
+  Pricing: "More material prices",
+  Messaging: "More messaging apps",
+  Website: "More website apps",
+  Weather: "More weather apps",
+};
+
+/** "Add a Zoho calendar", "Add an Outlook calendar"... */
+export const CALENDAR_NOUNS: Record<string, string> = {
+  google_calendar: "a Google calendar",
+  zoho_calendar: "a Zoho calendar",
+  outlook_calendar: "an Outlook calendar",
+  apple_calendar: "an iCloud calendar",
+  ics_calendar: "a calendar",
+};
+
+export interface AppInfo {
+  developer: string;
+  /** One line under the name, like an app store subtitle. */
+  tagline: string;
+  about: string;
+  highlights: Array<{ icon: IconName; title: string; text: string }>;
+  /** What Jobly can see and do in the other app. */
+  access: string[];
+  connectsWith: string;
+  /** Where to find a calendar's ICS link (calendar apps added by link). */
+  steps?: string[];
+  website: string;
+  /** Where Open goes once it's installed, when not the website: a page in Jobly, or the app itself. */
+  open?: string;
+  /**
+   * An app that works but isn't proven everywhere yet: it's marked Beta on the grid and on its
+   * page, which says this one sentence about what to watch.
+   */
+  beta?: string;
+}
+
+const CALENDAR_HIGHLIGHTS: AppInfo["highlights"] = [
+  { icon: "calendar", title: "Next to your visits", text: "Events show on the schedule in the calendar's color, by day, week and month." },
+  { icon: "clock", title: "Find a time knows", text: "Busy time counts when Jobly suggests open slots, so nobody gets double-booked." },
+  { icon: "refresh", title: "Always current", text: "Read again every 15 minutes, with repeats, moved meetings and cancellations." },
+];
+
+export const LINK_ACCESS = ["Read the events on the calendars you add", "Nothing else: it can't change the calendar"];
+
+export const APP_INFO: Record<string, AppInfo> = {
+  team_chat: {
+    developer: "Jobly",
+    tagline: "Channels for the whole team, each crew and the office",
+    about:
+      "Talk to your team where the work already is. Post news everyone reads in Announcements, keep each crew's day in its own channel, and keep quotes and billing in the office's. Who sees each channel goes by role, the same roles as Settings → Roles, so field crew only see what's theirs. Share photos from the job, link a job so everyone opens the same one, and @mention a person or a whole role to get their attention, with a push to their phone.",
+    highlights: [
+      { icon: "hash", title: "Channels by role", text: "Announcements, the whole team, each crew and the office. You decide who sees and posts in each." },
+      { icon: "mention", title: "@mentions", text: "Mention someone or a whole role, like @Field crew. They get a push on their phone." },
+      { icon: "camera", title: "Photos and jobs", text: "Send photos from the job site and link a job so everyone opens the same one." },
+    ],
+    access: ["Show chat to the people on your team, by their role", "Keep messages and photos in your own Jobly, like everything else", "Turning it off hides chat and keeps every message"],
+    connectsWith: "Jobly",
+    website: "https://jobly.com/docs/connections/team-chat/",
+    open: "/chat",
+  },
+  website_analytics: {
+    developer: "Jobly",
+    tagline: "Who visits your website, and what brings in work",
+    about:
+      "Paste one line into your website and see how many people visit it, which pages they read, where they came from (Google, Facebook, Yelp, an email or a campaign) and whether they were on a phone or a computer, in Marketing. Booking requests from your website's form say which page and source brought them in, so you can tell what's worth your time and money. It works like Google Analytics without the cookies: nothing that tells who a visitor is gets kept, so most businesses don't need a cookie banner for it, and it's all in your own Jobly.",
+    highlights: [
+      { icon: "metrics", title: "Visits and pages", text: "Visitors and page views against the period before, and the pages people read most." },
+      { icon: "globe", title: "Where they came from", text: "Search, social, directories like Yelp, AI assistants, emails and your own campaign links." },
+      { icon: "requests", title: "What brings in work", text: "Booking requests from your website show the page and source behind each one." },
+    ],
+    access: [
+      "Count page views on your website, with the page, where the visitor came from and their kind of device",
+      "No cookies, and nothing kept that tells who a visitor is: a visitor is a code that changes every day",
+      "Skip people who asked websites not to track them",
+      "Uninstalling stops counting and keeps your numbers",
+    ],
+    connectsWith: "A line on your website",
+    website: "https://jobly.com/docs/connections/website-analytics/",
+    open: "/marketing?tab=website",
+  },
+  website_forms: {
+    developer: "Jobly",
+    tagline: "Your website's own form, sending to Jobly",
+    about:
+      "Keep the contact or quote form your website already has, in its own fonts and colors, and change one thing: where it sends. Install, copy your form's address into its action, and every message becomes a request in Jobly and an email to the people you choose, with Reply going straight to whoever sent it. Messages from someone you already know land on their client record, found by their email or phone number; anyone new becomes a lead. It works like Formspree, so a Formspree form moves over by changing its address, and it's free and kept in your own Jobly.",
+    highlights: [
+      { icon: "code", title: "Any form, any website", text: "Wix, Squarespace, WordPress or hand-written HTML: point the form's action here and it works." },
+      { icon: "requests", title: "Straight into Requests", text: "Each message is a request on the right client, with every field the form asked." },
+      { icon: "mail", title: "In your inbox too", text: "An email for each message to up to five people. Reply, and you're answering the customer." },
+    ],
+    access: [
+      "Take messages sent to your forms' addresses, from your website or any other you allow",
+      "Turn away what looks like a bot: a hidden field and hourly limits on every form, plus a check you can turn on for each one and decide when it starts turning messages away",
+      "With Cloudflare Turnstile turned on for a form, ask Cloudflare whether each message came from a person",
+      "Add requests, and new clients for people it doesn't find by email or phone",
+      "Email each message to the people you list, from your connected email",
+      "Uninstalling stops taking messages and keeps your forms and requests",
+    ],
+    connectsWith: "Your website's form",
+    website: "https://jobly.com/docs/connections/website-forms/",
+    open: "/requests?from=website",
+  },
+  careers: {
+    developer: "Jobly",
+    tagline: "Job applications from your website, résumés and all",
+    about:
+      "Keep the careers page and Apply form your website already has, in its own fonts and colors, and change one thing: where it sends. Install, copy your form's address into its action, and every application lands in Applicants, a new place in the sidebar for the office: when they applied, the position, when they can start, their availability, pay, experience and driver's license, and their résumé. The people you choose get an email for each one, with Reply going straight to the applicant. Move each one from New to Interview to Hired, rate them, set the interview and keep notes. Applicants never become clients, and only owners, admins and office staff with the hiring area see them.",
+    highlights: [
+      { icon: "user", title: "Applicants in the sidebar", text: "Everyone who applied, newest first, with where each one stands and who's waiting to hear back." },
+      { icon: "file", title: "Résumés kept private", text: "Files come in with the application, and only the people who hire can open them." },
+      { icon: "mail", title: "In your inbox too", text: "An email for each application to up to five people. Reply, and you're answering the applicant." },
+    ],
+    access: [
+      "Take applications sent to your careers forms' addresses, with up to 3 files each",
+      "Turn away what looks like a bot: a hidden field and hourly limits on every form, plus a check you can turn on for each one and decide when it starts turning messages away",
+      "With Cloudflare Turnstile turned on for a form, ask Cloudflare whether each application came from a person",
+      "Add applicants, seen only by owners, admins and office staff with the hiring area",
+      "Email each application to the people you list, from your connected email",
+      "Uninstalling stops taking applications and keeps your forms and applicants",
+    ],
+    connectsWith: "Your website's Apply form",
+    website: "https://jobly.com/docs/connections/careers/",
+    open: "/applicants",
+  },
+  drive: {
+    developer: "Jobly",
+    tagline: "All your files in one place",
+    about:
+      "Every file your business keeps, in one place in the sidebar. Company files holds the ones that belong to no client, like your forms, price sheets and insurance papers, in folders you make. Clients lists every file on each client's properties, requests, quotes and jobs, so the plans from last year's job are one tap away. Drop in as many files as you like, big plan sets included, open PDFs, Word documents and pictures right in Jobly, fill in a form or mark up a plan, and each save keeps the one before it as an older version. Attach a file to a job and the crew on it gets it on their visit. Pick files in your Google Drive to copy them in. Files deleted in Jobly, from a plan to a visit photo or a receipt, wait in the Trash for 30 days. Most go straight back where they were; a sub's paperwork, an applicant's file or a receipt whose record is gone is downloaded from the Trash instead.",
+    highlights: [
+      { icon: "folder", title: "Company folders", text: "Forms, price sheets and insurance papers in folders of your own, with no client needed." },
+      { icon: "edit", title: "Open and edit", text: "Fill in a PDF form, mark up a plan or change a Word document without leaving Jobly." },
+      { icon: "history", title: "Every version kept", text: "Saving or uploading a new version keeps the older ones, so you can always go back." },
+      { icon: "trash", title: "A 30-day Trash", text: "Deleted files, from plans to visit photos and receipts, wait 30 days in the Trash, to put back or download." },
+      { icon: "cloud", title: "From Google Drive", text: "Pick files in your Google Drive and they're copied into Jobly." },
+      { icon: "link", title: "On the right job", text: "Attach a file to a client's property, a request, a quote or a job, and the crew on it gets it." },
+    ],
+    access: [
+      "Show Drive in the menu to owners, admins, office staff and estimators",
+      "Keep your files in your own Jobly, like everything else",
+      "Copy the files you pick in Google Drive into Jobly, with a Google sign-in that lasts an hour and is never kept",
+      "Keep deleted files in the Trash for 30 days, then delete them for good",
+      "Uninstalling hides Drive and keeps every file and folder",
+    ],
+    connectsWith: "Google Drive (import)",
+    website: "https://jobly.com/docs/connections/drive/",
+    open: "/drive",
+  },
+  marketing: {
+    developer: "Jobly",
+    tagline: "Reviews, referrals, campaigns and social posts that bring in work",
+    about:
+      "Turn happy clients into more work. Jobly asks for a Google review after a job, a visit or a paid invoice, whichever you choose, by text, email or both. Anyone who hasn't opened the link gets up to two reminders, and no client is asked automatically more than once every six months. Every client has a referral link to share, an email can ask for referrals a week after a job, and they get a $ or % credit on their next invoice once the friend pays their first one. Automated campaigns send by themselves: re-engage clients who haven't had a visit in a year, win back lost quotes and follow up on quotes nobody has answered. One-off email campaigns go to the clients you pick, by status, tags, city, the services they've had, their recurring work or time since their last visit, with promo codes and one-click unsubscribe. Every campaign shows who opened it, who clicked and the work it brought in. Post job photos your crew marks OK to share, and 4 and 5-star Google reviews as a picture, to your Facebook Page, Instagram and Google Business Profile, now or later, or have new 5-star reviews post by themselves. Clients who opt out aren't asked, and anyone who texts STOP gets no more texts.",
+    highlights: [
+      { icon: "star", title: "Reviews", text: "Ask after a job, a visit or a paid invoice, with up to two reminders for anyone who hasn't opened the link." },
+      { icon: "gift", title: "Referrals", text: "A link for every client, an email asking for referrals after a job, and a $ or % credit on their next invoice once the friend pays." },
+      { icon: "mail", title: "Campaigns", text: "Re-engage past clients, win back lost quotes and close pending quotes by themselves, or email the clients you pick, and see opens, clicks and the work they bring in." },
+      { icon: "share", title: "Social", text: "Post job photos and 4 and 5-star reviews to Facebook, Instagram and Google, now or later, with a caption AI can draft." },
+    ],
+    access: [
+      "Show Marketing in the menu to owners, admins and office staff with the marketing area",
+      "Email and text your clients from your connected email and Twilio, asking each automatically at most once every 6 months",
+      "Leave out clients who opted out of marketing or reviews, and texts to anyone who texted STOP",
+      "Put referral credits clients earn on their next invoices",
+      "Count opens and clicks on campaign and quote follow-up emails, with a tracking image and tracked links",
+      "Post photos marked OK to share and 4 and 5-star reviews to the pages you connect, never with a client's name or address",
+      "Uninstalling hides Marketing and stops every automatic message it sends to clients, and keeps everything",
+    ],
+    connectsWith: "Your email and Twilio",
+    website: "https://jobly.com/docs/clients/marketing/",
+    open: "/marketing",
+  },
+  paving: {
+    developer: "Jobly",
+    tagline: "Parking lots and driveways, from takeoff to invoice",
+    about:
+      "Adds Paving to the sidebar. Start from an address, measure the lot on the aerial map, and each project goes from the takeoff to the estimate, the proposal, the schedule and the invoice in one place. The measuring map gets paving items, like asphalt, sealcoat, crack seal and stall rows, each in its own color. Your trade in Settings → Company only picks your starter prices and terms, so you can have Roofing too.",
+    highlights: [
+      { icon: "paving", title: "A Paving section", text: "Every project in one place, from the takeoff to the invoice." },
+      { icon: "area", title: "Takeoffs on the map", text: "Asphalt, sealcoat, crack seal, stalls and striping, measured on the aerial." },
+      { icon: "quote", title: "Estimate to proposal", text: "The takeoff's quantities price the estimate, then go out as a proposal." },
+    ],
+    access: [
+      "Show Paving in the menu to owners, admins, office staff and estimators with the sales area",
+      "Show paving items on the measuring map",
+      "Uninstalling hides Paving and keeps every takeoff and estimate",
+    ],
+    connectsWith: "Jobly",
+    website: "https://jobly.com/docs/",
+    open: "/paving",
+  },
+  roofing: {
+    developer: "Jobly",
+    tagline: "Roof estimates, from measuring to invoice",
+    about:
+      "Adds Roofing to the sidebar. Start from an address and a roof package, measure the roof on the map with its pitch and edges, and each project goes from the estimate to the price range the homeowner is sent first, the site visit, the schedule and the invoice. Packages become roofs priced by the square, with Good, Better and Best options, and roof tools show on every measurement. Your trade in Settings → Company only picks your starter prices and terms, so you can have Paving too.",
+    highlights: [
+      { icon: "roofing", title: "A Roofing section", text: "Every roof estimate in one place, from measuring to the invoice." },
+      { icon: "package", title: "Roof packages", text: "Good, Better and Best, priced by the square from the measured roof." },
+      { icon: "dollar", title: "A price range first", text: "Send the homeowner a range, then set the exact price on site." },
+    ],
+    access: [
+      "Show Roofing in the menu to owners, admins, office staff and estimators with the sales area",
+      "Show roof tools on every measurement, and price packages as roofs",
+      "Uninstalling hides Roofing and keeps every estimate, package and price range",
+    ],
+    connectsWith: "Jobly",
+    website: "https://jobly.com/docs/",
+    open: "/roofing",
+  },
+  snow: {
+    developer: "Jobly",
+    tagline: "Snow customers, and crews told the day before",
+    about:
+      "Adds Snow to the sidebar. Mark any job as a snow customer: the inches that send the plow, the inches that send the salt, how soon it's cleared and who works it, a sub included. From 10am to 10pm the snow forecast from 6pm through the next day, so an overnight storm counts whole, is checked every hour at each property. When it calls for service, those people and whoever schedules your team are told once, and again if the storm grows into more pushes, and a subcontractor on it answers whether they can go out. A storm that turns up on the day itself, or grew overnight, is caught from 4am: they're told then, and you can schedule it for today. Salting customers are warned of freezing rain and refreezes. Nothing is scheduled by itself unless you turn that on: the Storm tab sorts your customers by what's left to do, and you schedule a storm in one click, which puts the crew and the people on tomorrow's visits. With Schedule storms automatically switched on there, each storm is scheduled as its people are told. On the day it shows how far along each customer is, and who's past the time they were to be clear by. Every storm goes in the season's log with what fell, a printable service report for each visit, and what it bills, by the push or by the depth of the storm. Set your standard storm prices once, as multiples of a push, and each customer's prices fill from them.",
+    highlights: [
+      { icon: "snow", title: "A trigger for each customer", text: "Plow at 2 inches, salt at half an inch, clear by 7: each job has its own." },
+      { icon: "bell", title: "Told the day before", text: "The crew, the subs on it and your schedulers hear when the forecast through tomorrow reaches it." },
+      { icon: "calendarCheck", title: "Schedule in one click", text: "Every customer that reaches their trigger gets a visit tomorrow, with its people on it." },
+    ],
+    access: [
+      "Show Snow in the menu to owners, and to admins and office staff with the schedule area",
+      "Check the forecast at each snow customer's property with the source picked in Settings (the US National Weather Service unless you change it, and Open-Meteo outside the United States), sending only its location",
+      "Notify the job's crew, the people you put on it, and owners, admins and office staff with the schedule area when the forecast calls for service, and ask the subcontractors who'd go out whether they can",
+      "With Schedule storms automatically switched on, put a storm's visits on the schedule as its people are told",
+      "Email a snow customer you set to be told when its storm is scheduled and when each visit is done, through two Automations rules you can reword or turn off",
+      "Show the National Weather Service's winter alerts in force where your snow customers are",
+      "Uninstalling hides Snow and stops the notices, and keeps every snow customer and trigger",
+    ],
+    connectsWith: "Jobly",
+    website: "https://jobly.com/docs/",
+    open: "/snow",
+  },
+  google_business: {
+    developer: "Google",
+    tagline: "Your Google reviews in Jobly",
+    about:
+      "See every Google review of your business in Marketing → Reviews: your rating and how it's trending, how many you've answered and how fast, and which review asks led to a review. Reply right from Jobly, starting from a suggestion AI drafts from what the client wrote, and the office hears about new reviews, low ratings first. Each review is matched to the client who left it when only one fits, and that client isn't asked for a review again. Google approves each Jobly server's access to reviews first, which takes about 2 weeks, and review asks keep working meanwhile.",
+    highlights: [
+      { icon: "star", title: "Reviews in Marketing", text: "Your rating, a monthly trend, response rate and time to reply, with every review and its reply." },
+      { icon: "sparkle", title: "Reply with a suggestion", text: "AI drafts a short reply from what they wrote. Read it, change it, then post it on Google." },
+      { icon: "check", title: "Asks stop once they've reviewed", text: "A client matched to their review isn't asked again, and their reminders stop." },
+    ],
+    access: [
+      "See your business's locations",
+      "Read your reviews",
+      "Post, change and delete the replies you write here, publicly on Google",
+      "Post to your Business Profile when you post from Marketing → Social",
+      "It can't change or remove your reviews",
+      "Needs Marketing - Jobly",
+      "Uninstalling stops bringing reviews in and keeps the ones already here",
+    ],
+    connectsWith: "Google sign-in",
+    website: "https://jobly.com/docs/connections/google-business-profile/",
+    open: "/marketing?tab=reviews",
+  },
+  meta: {
+    developer: "Meta",
+    tagline: "Post to your Facebook Page and Instagram",
+    about:
+      "Post job photos your crew marks OK to share, and 4 and 5-star Google reviews as a square picture, to your Facebook Page and its Instagram account from Marketing → Social, now or at a time you pick. AI can draft the caption, and posts never name a client or show their address: photos go up without their location. New 5-star reviews can post by themselves, a few a day, with time to change or cancel each one. It connects through a Meta app you make for your own business in about ten minutes, so nobody else's app sits between you and your Page.",
+    highlights: [
+      { icon: "camera", title: "Job photos", text: "Pick up to 10 photos marked OK to share. Instagram gets them padded to fit, never cropped." },
+      { icon: "star", title: "Reviews as pictures", text: "A 4 or 5-star review becomes a square card in your brand colour, with the reviewer's first name and last initial. Automatic posts are 5-star reviews only." },
+      { icon: "calendar", title: "Now or later", text: "Schedule posts, change or cancel them before they go, and see each one's link or what went wrong." },
+    ],
+    access: [
+      "Post photos and reviews to the Page and Instagram account you pick, when someone posts or schedules one (or automatic posts are on)",
+      "See the Pages you manage and the Instagram accounts linked to them",
+      "It can't read your messages, comments or ads",
+      "Needs Marketing - Jobly",
+      "Uninstalling signs your Meta app out of your Page and keeps the posts already made",
+    ],
+    connectsWith: "Your own Meta app",
+    website: "https://jobly.com/docs/connections/facebook-and-instagram/",
+    open: "/marketing?tab=social",
+  },
+  google_calendar: {
+    developer: "Google",
+    tagline: "Your Google calendars on the schedule, and visits on Google",
+    about:
+      "See appointments from your Google calendars next to your crews' visits, so nobody books over a supplier meeting or a day off. Jobly can also put every visit on a Google calendar it makes for you and keep it up to date as the schedule changes, so anyone you share it with sees the day on their phone.",
+    highlights: [
+      { icon: "calendar", title: "Pick your calendars", text: "Choose which calendars show on the schedule. Each one can belong to a crew." },
+      { icon: "clock", title: "Find a time knows", text: "Busy time on those calendars counts when Jobly suggests an open slot." },
+      { icon: "calendarCheck", title: "Visits on Google", text: "New, moved and finished visits show up in Google Calendar too, so the day is on everyone's phone." },
+    ],
+    access: [
+      "See the list of your calendars",
+      "Read events on the calendars you choose to show",
+      "Make one calendar for your visits and keep it up to date",
+      "It can't change or delete any of your own events",
+    ],
+    connectsWith: "Google sign-in",
+    steps: [
+      "In Google Calendar on a computer, open Settings (the gear at the top).",
+      "Under Settings for my calendars, click the calendar.",
+      "In Integrate calendar, copy the Secret address in iCal format.",
+    ],
+    website: "https://calendar.google.com/",
+    open: "/schedule",
+  },
+  zoho_calendar: {
+    developer: "Zoho",
+    tagline: "Zoho calendars on your schedule",
+    about:
+      "Show any Zoho calendar next to your crews' visits: the office calendar, a crew's calendar or someone's days off. Jobly reads it from its private ICS link, including repeating events and the changes made to them.",
+    highlights: CALENDAR_HIGHLIGHTS,
+    access: LINK_ACCESS,
+    connectsWith: "Calendar link (ICS)",
+    steps: [
+      "In Zoho Calendar, open the calendar's settings (Settings, then My Calendars, or the ⋮ menu next to it).",
+      "Under Share or Publish, turn on the private address.",
+      "Copy the private ICS link.",
+    ],
+    website: "https://www.zoho.com/calendar/",
+    open: "/schedule",
+  },
+  outlook_calendar: {
+    developer: "Microsoft",
+    tagline: "Outlook and Microsoft 365 calendars on your schedule",
+    about:
+      "Show Outlook.com, Microsoft 365 and Exchange calendars next to your crews' visits. Jobly reads a published calendar's ICS link, with Outlook's time zones, repeating meetings and free or busy time.",
+    highlights: CALENDAR_HIGHLIGHTS,
+    access: LINK_ACCESS,
+    connectsWith: "Calendar link (ICS)",
+    steps: [
+      "In Outlook on the web, open Settings, then Calendar, then Shared calendars.",
+      "Under Publish a calendar, pick the calendar and Can view all details, then Publish.",
+      "Copy the ICS link (not the HTML one).",
+    ],
+    website: "https://outlook.office.com/calendar/",
+    open: "/schedule",
+  },
+  apple_calendar: {
+    developer: "Apple",
+    tagline: "iCloud calendars on your schedule",
+    about:
+      "Show calendars from iPhone, iPad and Mac (iCloud) next to your crews' visits. Turn on Public Calendar for the calendar and add its link here. Anyone with that link can see the calendar, so Jobly keeps it encrypted.",
+    highlights: CALENDAR_HIGHLIGHTS,
+    access: LINK_ACCESS,
+    connectsWith: "Calendar link (webcal)",
+    steps: [
+      "On iPhone, open Calendar and tap Calendars at the bottom.",
+      "Tap ⓘ next to the calendar and turn on Public Calendar.",
+      "Tap Share Link, then Copy. (On a Mac or at icloud.com, the share button next to the calendar has the same option.)",
+    ],
+    website: "https://www.icloud.com/calendar/",
+    open: "/schedule",
+  },
+  ics_calendar: {
+    developer: "Any calendar app",
+    tagline: "Any calendar with an ICS or webcal link",
+    about:
+      "Yahoo, Fastmail, Proton, Nextcloud, booking and rental tools, holiday and school calendars: if it gives you a subscribe link, its events can sit next to your crews' visits.",
+    highlights: CALENDAR_HIGHLIGHTS,
+    access: LINK_ACCESS,
+    connectsWith: "Calendar link (ICS)",
+    steps: [
+      "In your calendar app, look for Share, Publish, Export or Subscribe.",
+      "Copy the link that ends in .ics or starts with webcal://.",
+    ],
+    website: "https://en.wikipedia.org/wiki/ICalendar",
+    open: "/schedule",
+  },
+  anthropic: {
+    developer: "Anthropic",
+    tagline: "Jobly's AI on your own Anthropic key",
+    about:
+      "Power Jobly's own AI with Claude: rewriting a message, drafting a quote, a campaign, a caption or a reply to a review, answering a crew's question from your guides, and reading receipts. Add your Anthropic API key and everyone's asks, and anything Jobly drafts by itself, use it; Anthropic bills your account for what's used. Only what an ask is about goes to Anthropic: the message to rewrite, the request and price list a quote is drafted from, the review a reply answers, the parts of your guides that match a question, the receipt to read. To use Jobly from inside Claude instead, add the connector in Settings → AI assistants.",
+    highlights: [
+      { icon: "sparkle", title: "Drafts and answers", text: "Rewrites, quote and campaign drafts, captions, review replies and answers from your guides." },
+      { icon: "receipt", title: "Receipts read for you", text: "A photo or a supplier's invoice fills in the expense for you to check, once you turn reading on." },
+      { icon: "dollar", title: "Billed to you", text: "Anthropic bills your own account for what Jobly's AI uses." },
+    ],
+    access: [
+      "Send Anthropic what an ask is about: the message to rewrite, the request and price list a quote is drafted from, the review a reply answers, the receipt to read",
+      "Send the parts of your guides that match a question, to answer it",
+      "Nothing else: it can't look things up in Jobly or change anything",
+      "Anthropic bills your account directly for what's used",
+      "Uninstalling removes your key from Jobly",
+    ],
+    connectsWith: "Key from Anthropic",
+    website: "https://claude.ai/",
+  },
+  open_meteo: {
+    developer: "Open-Meteo",
+    tagline: "For commercial use, with your own key. Non-commercial use is included in Jobly.",
+    about:
+      "This app is for commercial use of Open-Meteo. Non-commercial use is already included in Jobly, with nothing to add: Open-Meteo's free service is a choice in Settings → Weather rules, and it's where the forecast for a property outside the United States comes from when the source is the US National Weather Service, as it is until you change it. Open-Meteo's terms keep that free service to non-commercial use. A paid Open-Meteo plan comes with a key and a commercial licence: paste the key here, then pick Open-Meteo (commercial) in Settings → Weather rules, and every forecast, for the weather warnings on visits and for Snow, is asked of the paid service with your key. The forecasts are the same ones. Remove the key and forecasts go back to the National Weather Service.",
+    highlights: [
+      { icon: "cloudSnow", title: "The same forecasts", text: "Hour by hour and ten days out, for every property." },
+      { icon: "check", title: "Licensed for business", text: "Open-Meteo's paid plans allow commercial use. Its free service, built in, doesn't." },
+      { icon: "settings", title: "One switch", text: "Pick it in Settings → Weather rules once the key is in." },
+    ],
+    access: [
+      "Ask Open-Meteo's paid service for forecasts with your key, sending only each property's location",
+      "Nothing else: no clients, prices or anything else from Jobly",
+      "Open-Meteo bills your account directly",
+    ],
+    connectsWith: "Key from Open-Meteo",
+    website: "https://open-meteo.com/en/pricing",
+    open: "/settings?tab=weather",
+  },
+  fal: {
+    developer: "fal",
+    tagline: "Find all the paving in view at once",
+    about:
+      "With fal.ai, Find paving outlines all the asphalt and concrete on the aerial at once, cuts the islands and buildings out of the lot, and counts the striped stalls, so a takeoff starts drawn and you check it instead of tracing it. It runs Meta's Segment Anything model (SAM 3) on fal.ai, with your own fal.ai account: about half a cent for each thing it looks for, billed by fal. Only the aerial picture of the lot you're measuring goes to fal.ai. Without it, Find paving's free Tap to outline still outlines one surface per tap, right in the browser.",
+    highlights: [
+      { icon: "sparkle", title: "Outlined for you", text: "Asphalt and concrete come back as shapes on the map, each marked as its takeoff item and ready to edit." },
+      { icon: "scissors", title: "Islands cut out", text: "Planted islands and buildings in the lot come out of the asphalt, so sealcoat isn't priced on grass." },
+      { icon: "pin", title: "Stalls counted", text: "Striped stalls are counted where the imagery is sharp enough to see the lines." },
+    ],
+    access: ["Send fal.ai the aerial picture of the lot when someone uses Find paving's Find everything in view", "Nothing else: no clients, prices or anything else from Jobly", "fal.ai bills your account directly, about half a cent per thing found"],
+    connectsWith: "Key from fal.ai",
+    website: "https://fal.ai/",
+    open: "/measure",
+  },
+  chatgpt: {
+    developer: "OpenAI",
+    tagline: "Jobly's AI on your OpenAI key or your ChatGPT plan",
+    about:
+      "Power Jobly's own AI with OpenAI: rewriting a message, drafting a quote, a campaign, a caption or a reply to a review, answering a crew's question from your guides, and reading receipts. There are two ways, and you can use both. An OpenAI API key is for the whole company: everyone's asks, and anything Jobly drafts by itself, use it, and OpenAI bills your API account for what's used. Continue with ChatGPT is each person's own: sign in with your ChatGPT account and what you ask the AI yourself is answered on your ChatGPT Plus or Pro plan, never anyone else's asks. Only what an ask is about goes to OpenAI: the message to rewrite, the request and price list a quote is drafted from, the review a reply answers, the parts of your guides that match a question, the receipt to read. To use Jobly from inside ChatGPT instead, add the connector in Settings → AI assistants.",
+    highlights: [
+      { icon: "sparkle", title: "Drafts and answers", text: "Rewrites, quote and campaign drafts, captions, review replies and answers from your guides." },
+      { icon: "receipt", title: "Receipts read for you", text: "A photo or a supplier's invoice fills in the expense for you to check, once you turn reading on." },
+      { icon: "user", title: "A key, or your own plan", text: "One OpenAI key for the whole company, or each person's ChatGPT plan for what they ask themselves." },
+    ],
+    access: [
+      "Send OpenAI what an ask is about: the message to rewrite, the request and price list a quote is drafted from, the review a reply answers, the receipt to read",
+      "Send the parts of your guides that match a question, to answer it",
+      "Nothing else: it can't look things up in Jobly or change anything",
+      "With an API key, OpenAI bills your API account directly for what's used",
+      "With Continue with ChatGPT, your own ChatGPT plan pays for what you ask yourself, and what you ask goes to OpenAI on your own account",
+      "Uninstalling removes your key from Jobly and signs your ChatGPT plan out",
+    ],
+    connectsWith: "OpenAI key or ChatGPT sign-in",
+    website: "https://chatgpt.com/",
+  },
+  quickbooks: {
+    developer: "Intuit",
+    tagline: "Your books, without typing anything twice",
+    about:
+      "When QuickBooks Online is your book of record, Jobly sends clients, invoices and payments there as they happen. Your bookkeeper works in QuickBooks; your team works in Jobly.",
+    highlights: [
+      { icon: "invoice", title: "Invoices", text: "Sent invoices arrive with their lines, discounts and tax, and keep up when they change." },
+      { icon: "dollar", title: "Payments", text: "Each payment is recorded against the right invoice." },
+      { icon: "users", title: "Customers", text: "Clients are matched by name, or added." },
+    ],
+    access: ["Read your company's name", "Add customers, invoices and payments, and update the invoices it added"],
+    connectsWith: "Intuit sign-in",
+    website: "https://quickbooks.intuit.com/",
+    open: "https://qbo.intuit.com/",
+    beta: "This sync hasn't been proven against every kind of QuickBooks account yet, so check the first few invoices in QuickBooks.",
+  },
+  zoho_books: {
+    developer: "Zoho",
+    tagline: "Your books, without typing anything twice",
+    about:
+      "When Zoho Books is your book of record, Jobly sends clients, invoices and payments there as they happen, in whichever Zoho data center your account lives.",
+    highlights: [
+      { icon: "invoice", title: "Invoices", text: "Sent invoices arrive with their lines and discounts, and keep up when they change." },
+      { icon: "dollar", title: "Payments", text: "Each payment is recorded against the right invoice." },
+      { icon: "users", title: "Contacts", text: "Clients are added as customers." },
+    ],
+    access: ["Read your organization's name", "Add contacts, invoices and payments, and update the invoices it added"],
+    connectsWith: "Zoho sign-in",
+    website: "https://www.zoho.com/books/",
+    open: "https://books.zoho.com/",
+    beta: "This sync hasn't been proven against every kind of Zoho Books account yet, so check the first few invoices in Zoho Books.",
+  },
+  stripe: {
+    developer: "Stripe",
+    tagline: "Invoices, payments and deposits, in step with Stripe",
+    about:
+      "Invoices you send from Jobly go to Stripe too, and clients pay them by card or bank from their link or client portal, once. Invoices you make in Stripe, like a big job you'd rather bill by hand, come into Jobly by themselves. Every payment shows the fee Stripe kept and the bank deposit it arrived in, and your past invoices can come in from Stripe without anyone being emailed.",
+    highlights: [
+      { icon: "invoice", title: "Both ways", text: "Sent invoices appear in Stripe; invoices made in Stripe come in here." },
+      { icon: "dollar", title: "Paid once", text: "Card or bank. A bank payment shows as on its way until it clears." },
+      { icon: "receipt", title: "Fees and deposits", text: "See what Stripe kept and which deposit each payment arrived in." },
+    ],
+    access: [
+      "Add customers, invoices and invoice items, and void invoices it made",
+      "Read invoices, payments, refunds, disputes and deposits",
+      "Add one webhook to your account so payments show up right away",
+      "Save cards for clients who agree, charge them, and refund payments",
+    ],
+    connectsWith: "Key from Stripe",
+    website: "https://stripe.com/",
+    open: "https://dashboard.stripe.com/",
+  },
+  abc_supply: {
+    developer: "ABC Supply",
+    tagline: "Your own material prices in every roofing estimate",
+    about:
+      "Connect your ABC Supply account and your estimates price their materials at your branch, at your prices: the shingles, underlayment, drip edge and everything else, in whole bundles, rolls and pieces. Pick each material from ABC's catalog once and say how many go into a square or a foot; after that every roof you measure comes out with exactly what to order and what it costs, next to the labor and your margin. Connecting also adds a Catalog to Roofing: ABC's items at your branch with your price on each, what your account buys most up front, every color and size with its specs, and your materials checked with ABC in one tap, so one ABC stops carrying is swapped out everywhere it's used. It uses an app you make in ABC's developer portal for your own company, so your prices stay between you and ABC.",
+    highlights: [
+      { icon: "search", title: "A catalog in Roofing", text: "Browse ABC's items at your branch with your price on each: what you buy most, every color and size, and its specs." },
+      { icon: "roofing", title: "Priced from the roof", text: "Squares and edges from the measurement become bundles, rolls and pieces, rounded up, at today's prices." },
+      { icon: "dollar", title: "Costs you can see", text: "Each material, what it comes to, and the materials total sit next to the labor and the margin." },
+    ],
+    access: [
+      "Read your ABC account and branch, and ABC's catalog",
+      "Ask ABC for your prices on the materials your estimates use",
+      "Nothing else: it can't place orders or see your invoices",
+      "Prices are kept with your price list and estimates, never shown next to another supplier's",
+    ],
+    connectsWith: "Keys from ABC Supply",
+    website: "https://www.abcsupply.com/",
+    open: "/roofing/catalog",
+  },
+  lob: {
+    developer: "Lob",
+    tagline: "Postcards to your clients' mailboxes",
+    about:
+      "Turn a campaign into a postcard: pick a size, put one of your job photos or any picture on the front and a short note on the back, and Lob prints and mails one to each client in the segment you choose, with your return address. Connect your own Lob account with its secret key. Start with the test key: Lob makes every card so you can see it in your Lob dashboard, but prints and mails nothing. Switch to the live key when you're ready, and Lob bills your account for each card it mails.",
+    highlights: [
+      { icon: "image", title: "Your photo on the front", text: "A job photo, its drawn-on copy, or any picture you upload." },
+      { icon: "users", title: "The clients you pick", text: "The same segments as email campaigns, with a full mailing address." },
+      { icon: "check", title: "Test before you mail", text: "A test key makes the cards without mailing or charging anything." },
+    ],
+    access: ["Make postcards in your Lob account, one for each client in a campaign", "Read your Lob account to check the key", "Nothing else: it can't see your other mail or billing"],
+    connectsWith: "Key from Lob",
+    website: "https://www.lob.com/",
+    open: "/marketing?tab=campaigns",
+  },
+  twilio: {
+    developer: "Twilio",
+    tagline: "Texts that reach your clients",
+    about:
+      "Send visit reminders and on-my-way texts, and keep two-way conversations with clients in Messages. Connect your own Twilio account with three things from your Twilio console: your Account SID, your Auth Token and your number. Jobly checks them with Twilio before saving, texts from your number, and can point the number's replies at Messages for you. Twilio bills you directly for what you send.",
+    highlights: [
+      { icon: "bell", title: "Reminders", text: "The day before, so clients leave the gate open." },
+      { icon: "truck", title: "On my way", text: "One tap from the field when a crew heads out." },
+      { icon: "messages", title: "Conversations", text: "Replies land in Messages for the whole office." },
+    ],
+    access: ["Send texts from your number", "Receive replies, and stop texting anyone who texts STOP", "Set where your number sends incoming texts, only when you ask"],
+    connectsWith: "Your Twilio account",
+    website: "https://www.twilio.com/",
+    open: "/messages",
+  },
+  sveltia: {
+    developer: "Sveltia",
+    tagline: "Edit your website without leaving Jobly",
+    about:
+      "Sveltia CMS is the editor many fast, modern websites come with: pages, blog posts, services and photos, with a preview as you type. Add your website's address once and Website appears in the menu with your editor right there, next to your clients and schedule. Sign in the way you do on your site, with GitHub or a token, and changes save to your website exactly as they do when you open it on its own. Decap CMS (once called Netlify CMS) works too.",
+    highlights: [
+      { icon: "globe", title: "Your site, in Jobly", text: "Website in the menu opens your site's editor, for owners, admins and anyone with Marketing." },
+      { icon: "edit", title: "Pages, posts and photos", text: "Write a post, change a price or swap a photo, and see it as visitors will before it goes live." },
+      { icon: "lock", title: "Your own sign-in", text: "Sign in with GitHub, as you do on your site. Jobly never sees it." },
+    ],
+    access: [
+      "Show your website's editor (its /admin page) inside Jobly",
+      "Read that page and its settings, to check the editor is there and where it saves",
+      "Nothing else: it can't see your sign-in or change your website. Sveltia saves your edits, as it does on your site",
+    ],
+    connectsWith: "Your website's address",
+    website: "https://sveltiacms.app/",
+    open: "/website",
+  },
+};
+
+/** Shown when an app has no entry above (a newer API than this web app). */
+export const infoFor = (app: Pick<AppRow, "id" | "name" | "description" | "docs">): AppInfo =>
+  APP_INFO[app.id] ?? { developer: app.name, tagline: app.description, about: app.description, highlights: [], access: [], connectsWith: "", website: app.docs };

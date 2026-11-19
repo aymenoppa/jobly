@@ -1,0 +1,19 @@
+/*
+ * The app's tooltip (Tooltips.tsx): a small, quiet chip in the app's ink (light on a dark page), a
+ * little above its element, fading in and out quickly. On the page it's above everything else,
+ * toasts and banners included; in a dialog or popover it's inside it (layer.ts).
+ */
+.positioner { z-index: 300; }
+/* Its element scrolled out of sight or left the page: it goes too. */
+.positioner[data-anchor-hidden] { visibility: hidden; }
+.tip {
+  max-width: min(280px, calc(100vw - 16px)); padding: 5px 8px; border-radius: var(--radius-sm);
+  background: var(--solid); color: var(--on-solid); box-shadow: var(--shadow-sm);
+  font-size: var(--fs-12); font-weight: 500; line-height: 16px; white-space: pre-line; overflow-wrap: anywhere;
+  transform-origin: var(--transform-origin);
+  transition: opacity var(--dur-fast) var(--ease-out), transform var(--dur-fast) var(--ease-out);
+}
+.tip[data-starting-style], .tip[data-ending-style] { opacity: 0; transform: scale(0.96); }
+@media (prefers-reduced-motion: reduce) {
+  .tip[data-starting-style], .tip[data-ending-style] { transform: none; }
+}

@@ -1,0 +1,88 @@
+/*
+ * Dropdowns, type-to-search pickers and number boxes (Select.tsx, Combobox.tsx, NumberInput.tsx).
+ * Imported by those components rather than kept in components.css, so it downloads with the screens
+ * that use them, not with the first page. Drawn to match .select, .input and .menu.
+ */
+
+/* ---------- A Select's button: .select's box and chevron, with its words cut short like a native select's ---------- */
+.select-trigger { display: inline-flex; align-items: center; text-align: left; white-space: nowrap; line-height: normal; }
+.select-trigger[data-popup-open] { border-color: var(--green); box-shadow: var(--ring); }
+/*
+ * A select inside a pill (Select's "select-plain"): the button is only the words, as the native select
+ * was, and the pill keeps its own box, ring and arrow. Each pill's rules are beside the native ones.
+ */
+.select-plain { border: 0; background: transparent; font: inherit; color: inherit; cursor: pointer; outline: none; padding: 0; height: auto; min-width: 0; box-shadow: none; }
+.select-plain[data-popup-open] { box-shadow: none; }
+.select-pill .select-plain { padding-right: 2px; }
+.range-pill .select-plain { color: var(--green-dark); padding-left: 2px; }
+.metric-pick .select-plain { margin-right: -22px; padding: 0 22px 0 0; }
+.schedule-filter .select-plain { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; }
+.select-value { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---------- The floating list: a Select's, or a picker's ---------- */
+/* Above the sticky header, the mobile nav and a card's sticky bars; inside a dialog it's in the dialog's own layer. */
+.picker-positioner { z-index: 60; outline: none; }
+.picker-popup {
+  min-width: var(--anchor-width); max-width: min(var(--available-width), 480px); max-height: min(var(--available-height), 360px); overflow-y: auto; overscroll-behavior: contain;
+  padding: 4px; border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); color: var(--ink); box-shadow: var(--shadow-md); outline: none;
+  transform-origin: var(--transform-origin); transition: opacity var(--dur-fast) var(--ease-out), transform var(--dur-fast) var(--ease-out);
+}
+.picker-popup[data-starting-style], .picker-popup[data-ending-style] { opacity: 0; transform: scale(0.97); }
+/* As wide as the box it opens from (a search box): the results read as its own. */
+.picker-popup-fit { width: var(--anchor-width); max-width: var(--anchor-width); }
+/* A search at the top and the results under it, which scroll on their own (LineItems' price list). */
+.picker-popup-search { display: flex; flex-direction: column; width: 360px; max-width: min(var(--available-width), calc(100vw - 16px)); padding: 0; overflow: hidden; }
+.picker-search { position: relative; display: flex; align-items: center; padding: 8px; border-bottom: 1px solid var(--divider); }
+.picker-search > .addon { position: absolute; left: 18px; color: var(--text-3); pointer-events: none; display: grid; }
+.picker-search > .input { padding-left: 30px; }
+.picker-popup-search .picker-list { min-height: 0; max-height: min(280px, calc(var(--available-height) - 56px)); overflow-y: auto; overscroll-behavior: contain; padding: 4px; }
+.picker-empty { padding: 16px; color: var(--text-3); font-size: var(--fs-13); text-align: center; }
+.picker-empty:empty { display: none; }
+@media (prefers-reduced-motion: reduce) {
+  .picker-popup { transition: opacity var(--dur-fast); }
+  .picker-popup[data-starting-style], .picker-popup[data-ending-style] { transform: none; }
+}
+
+/* One choice: a check by the one picked, the highlighted one filled, like a menu's items. */
+.picker-item {
+  display: grid; grid-template-columns: 16px minmax(0, 1fr); align-items: center; column-gap: 8px; min-height: 34px; padding: 6px 12px 6px 8px;
+  border-radius: var(--radius-control); font-size: var(--fs-14); font-weight: 500; color: var(--ink); cursor: pointer; user-select: none; -webkit-user-select: none; outline: none;
+}
+.picker-item[data-selected] { font-weight: 650; }
+.picker-item[data-disabled] { opacity: 0.45; cursor: not-allowed; }
+.picker-check { grid-column: 1; display: grid; place-items: center; color: var(--green-dark); }
+.picker-item-text { grid-column: 2; min-width: 0; overflow-wrap: anywhere; }
+.picker-group:not(:first-child) { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--divider); }
+.picker-group-label { padding: 6px 12px 4px 32px; font-size: var(--fs-11); font-weight: 700; color: var(--text-3); text-transform: uppercase; letter-spacing: var(--tracking-caps); cursor: default; }
+/* Any row a picker draws its own way (a client with their address, a service with its price) fills the same when highlighted. */
+.picker-option { cursor: pointer; user-select: none; -webkit-user-select: none; }
+.picker-item[data-highlighted], .picker-option[data-highlighted] { background: var(--fill-2); }
+.picker-option[data-disabled] { cursor: progress; }
+/* A list that stays open in a card (ClientPicker): its first row has no line above it, like a card's. */
+.picker-rows [role="listbox"] > .card-row:first-child { border-top: 0; }
+/* Drawn just inside, as the list clips its edges (like .menu-item in base.css). */
+.picker-item:focus-visible, .picker-option:focus-visible { outline-offset: -2px; }
+
+/* ---------- A number box: an .input with the number and, for a mouse, up and down beside it ---------- */
+.number-field { display: flex; align-items: stretch; cursor: text; }
+.number-field:focus-within { border-color: var(--green); box-shadow: var(--ring); }
+.number-field[data-disabled] { background-color: var(--fill); color: var(--text-3); cursor: not-allowed; }
+.number-field-input {
+  flex: 1 1 auto; width: 100%; min-width: 0; height: 100%; margin: 0; padding: 0; border: 0; border-radius: 0; outline: none; box-shadow: none;
+  background: transparent; color: inherit; font: inherit; text-align: inherit; font-variant-numeric: tabular-nums;
+}
+.number-field-input::placeholder { color: var(--text-3); }
+.number-field-input:disabled { cursor: not-allowed; }
+.number-field:has(> .number-field-steps) { padding-right: 0; }
+.number-field-steps { flex: none; display: grid; grid-template-rows: 1fr 1fr; width: 22px; margin-left: 8px; border-left: 1px solid var(--divider); }
+.number-field-step { display: grid; place-items: center; min-height: 0; padding: 0; border: 0; background: none; color: var(--text-3); cursor: pointer; touch-action: manipulation; }
+.number-field-step:first-child { border-top-right-radius: calc(var(--radius-control) - 1px); }
+.number-field-step:last-child { border-top: 1px solid var(--divider); border-bottom-right-radius: calc(var(--radius-control) - 1px); }
+.number-field-step:hover:not(:disabled) { background: var(--fill-2); color: var(--ink); }
+.number-field-step:active:not(:disabled) { background: var(--fill-3); }
+.number-field-step:disabled { opacity: 0.35; cursor: default; }
+/* A finger types the number on the phone's number pad, as with a native number box, so the arrows go. */
+@media (pointer: coarse) {
+  .number-field-steps { display: none; }
+  .number-field:has(> .number-field-steps) { padding-right: 10px; }
+}

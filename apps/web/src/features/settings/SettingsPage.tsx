@@ -1,0 +1,102 @@
+/**
+ * Settings, grouped the way people look for things (sections.ts): you, the business, talking to
+ * clients, the team, what it connects to, and where it's hosted. Automations, online booking and apps have their own screens and open from here.
+ */
+import { Link, useSearchParams } from "react-router-dom";
+import { Icon } from "@/components/ui/Icon";
+import { PageHeader } from "@/components/ui/PageHeader";
+import { hasRole, isSub, useSession } from "@/lib/session";
+import { AssistantSettings } from "./AssistantSettings";
+import { CalendarSettings } from "./CalendarSettings";
+import { ChecklistSettings } from "./ChecklistSettings";
+import { ClientNotificationSettings } from "./ClientNotificationSettings";
+import { CompanySettings } from "./CompanySettings";
+import { ContractSettings } from "./ContractSettings";
+import { CrewSettings } from "./CrewSettings";
+import { CustomFieldSettings } from "./CustomFieldSettings";
+import { DataSettings } from "./DataSettings";
+import { EmailSettings } from "./EmailSettings";
+import { HostingSettings } from "./HostingSettings";
+import { LicenseSettings } from "./LicenseSettings";
+import { MapsSettings } from "./MapsSettings";
+import { PaymentSettings } from "./PaymentSettings";
+import { PriceList } from "./PriceList";
+import { ProfileSettings } from "./ProfileSettings";
+import { RolesSettings } from "./RolesSettings";
+import { SalesAreaSettings } from "./SalesAreaSettings";
+import { ScheduleSettings } from "./ScheduleSettings";
+import { t } from "@/lib/i18n";
+import { settingsGroups, type SettingsTab } from "./sections";
+import { StorageSettings } from "./StorageSettings";
+import { TeamSettings } from "./TeamSettings";
+import { TemplateSettings } from "./TemplateSettings";
+import { WebAddressSettings } from "./WebAddressSettings";
+import { WeatherSettings } from "./WeatherSettings";
+
+export function SettingsPage() {
+  const session = useSession();
+  const [params, setParams] = useSearchParams();
+  const isAdmin = hasRole(session, "admin");
+  const groups = settingsGroups(session);
+  // A sub has only their profile here.
+  const sub = isSub(session);
+
+  const tabs = groups.flatMap((g) => g.items).flatMap((i) => ("tab" in i ? [i.tab] : []));
+  const requested = params.get("tab") as SettingsTab | null;
+  const tab = requested && tabs.includes(requested) ? requested : isAdmin ? "company" : "profile";
+
+  return (
+    <>
+      <PageHeader title={sub ? t("Profile") : t("Settings")} />
+      <div className={sub ? undefined : "settings-layout"}>
+        {!sub && <nav className="settings-nav" aria-label={t("Settings sections")}>
+          {groups.map((g) => (
+            <div key={g.title} className="settings-group">
+              <span className="settings-group-title">{t(g.title)}</span>
+              {g.items.map((item) =>
+                "tab" in item ? (
+                  <button key={item.tab} type="button" className="nav-link" aria-current={tab === item.tab ? "page" : undefined} onClick={() => setParams({ tab: item.tab }, { replace: true })}>
+                    <Icon name={item.icon} filled={tab === item.tab} />
+                    {t(item.label)}
+                  </button>
+                ) : (
+                  <Link key={item.to} to={item.to} className="nav-link">
+                    <Icon name={item.icon} />
+                    {t(item.label)}
+                    <span className="settings-out" aria-hidden="true"><Icon name="chevronRight" size={14} /></span>
+                  </Link>
+                ),
+              )}
+            </div>
+          ))}
+        </nav>}
+        <div className="settings-body">
+          {tab === "profile" && <ProfileSettings />}
+          {tab === "company" && <CompanySettings />}
+          {tab === "payments" && <PaymentSettings />}
+          {tab === "schedule" && <ScheduleSettings />}
+          {tab === "address" && <WebAddressSettings />}
+          {tab === "hosting" && <HostingSettings />}
+          {tab === "storage" && <StorageSettings />}
+          {tab === "team" && <TeamSettings />}
+          {tab === "roles" && <RolesSettings />}
+          {tab === "crews" && <CrewSettings />}
+          {tab === "sales-areas" && <SalesAreaSettings />}
+          {tab === "prices" && <PriceList />}
+          {tab === "templates" && <TemplateSettings />}
+          {tab === "contracts" && <ContractSettings />}
+          {tab === "custom-fields" && <CustomFieldSettings />}
+          {tab === "checklists" && <ChecklistSettings />}
+          {tab === "weather" && <WeatherSettings />}
+          {tab === "client-notifications" && <ClientNotificationSettings />}
+          {tab === "email" && <EmailSettings />}
+          {tab === "calendars" && <CalendarSettings />}
+          {tab === "assistants" && <AssistantSettings />}
+          {tab === "maps" && <MapsSettings />}
+          {tab === "data" && <DataSettings />}
+          {tab === "license" && <LicenseSettings />}
+        </div>
+      </div>
+    </>
+  );
+}

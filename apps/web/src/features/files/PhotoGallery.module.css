@@ -1,0 +1,67 @@
+/*
+ * The photo gallery (PhotoGallery.tsx): a dialog as tall as the screen allows, the photos on a stage
+ * that stays dark in both themes so they're seen as they are, and a line under them with the photo's
+ * name and Open full size. On a phone it's the bottom sheet, the stage edge to edge, and swiping
+ * takes the place of the arrows.
+ */
+
+/* The dialog: its full height whatever the photo, so it doesn't jump from one photo to the next. */
+.sheet { height: min(calc(100vh - 48px), 860px); }
+/*
+ * It keeps the focus while the arrow keys move the photos, so the page's focus ring would sit around
+ * the whole gallery the moment a key is pressed. It isn't a tab stop; its buttons keep their rings.
+ */
+.sheet:focus-visible { outline: none; }
+
+/* Over the dialog's own padding and scrolling for its content (components.css). */
+:global(.dialog-content) > .gallery {
+  flex: 1 1 auto; display: grid; grid-template-rows: minmax(0, 1fr) auto; gap: 12px;
+  padding: 14px 20px 16px; overflow: hidden;
+}
+
+.stage { position: relative; min-height: 0; border-radius: var(--radius-control); overflow: hidden; background: #0c171c; }
+.viewport { height: 100%; overflow: hidden; cursor: grab; }
+.viewport:active { cursor: grabbing; }
+/* A strip of the stage between photos as they slide (Embla's spacing: padding on the slides, taken back on the strip). */
+.slides { display: flex; height: 100%; margin-left: -12px; touch-action: pan-y pinch-zoom; }
+/* One cell the slide's own size, so a tall photo is fitted to it rather than growing the row. */
+.slide { position: relative; flex: 0 0 100%; min-width: 0; padding-left: 12px; display: grid; grid-template: minmax(0, 1fr) / minmax(0, 1fr); }
+.photo {
+  width: 100%; height: 100%; object-fit: contain; display: block;
+  user-select: none; -webkit-user-select: none; -webkit-user-drag: none; -webkit-touch-callout: none;
+  opacity: 0; transition: opacity var(--dur) var(--ease-out);
+}
+.photo[data-shown] { opacity: 1; }
+/* Under the photo until it has loaded (or failed: Open full size is still there to try). */
+.wait { position: absolute; top: 50%; left: calc(50% + 6px); width: 22px; height: 22px; margin: -11px 0 0 -11px; color: rgba(255, 255, 255, 0.7); }
+.photo[data-shown] + .wait, .photo[data-failed] + .wait { display: none; }
+
+/* The arrows: the same dark, ringed circle as the buttons on a thumbnail, finger-sized. */
+.arrow {
+  position: absolute; top: 50%; width: 44px; height: 44px; margin-top: -22px; padding: 0;
+  display: grid; place-items: center; border: 0; border-radius: 50%;
+  background: rgba(15, 42, 53, 0.62); color: #fff; box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.92);
+  cursor: pointer; transition: background var(--dur-fast), opacity var(--dur-fast);
+}
+.arrow:hover { background: rgba(15, 42, 53, 0.86); }
+.arrow:active { transform: scale(0.94); }
+.arrow:focus-visible { outline: none; box-shadow: 0 0 0 1.5px #fff, var(--ring); }
+.prev { left: 12px; }
+.next { right: 12px; }
+/* Nothing further that way: out of sight, unless it has the focus. */
+.arrow[aria-disabled="true"] { opacity: 0; cursor: default; }
+.arrow[aria-disabled="true"]:focus-visible { opacity: 0.5; }
+
+.foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; }
+.name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-3); font-size: var(--fs-13); }
+.foot > a { flex: none; }
+
+@media (max-width: 900px) {
+  .sheet { height: calc(100dvh - 24px); }
+  :global(.dialog-content) > .gallery { gap: 0; padding: 12px 0 0; }
+  .stage { border-radius: 0; }
+  .foot { padding: 10px 16px calc(10px + env(safe-area-inset-bottom)); }
+}
+@media (max-width: 640px) {
+  .arrow { display: none; }
+}

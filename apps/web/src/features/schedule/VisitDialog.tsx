@@ -1,0 +1,642 @@
+/**
+ * Create or edit a visit, assessment, task or event: date, start and end time (any minute, like
+ * Google Calendar) or anytime, crew, people, status and notes, with "Find a time" for open slots.
+ * An entry with no client property (a task at the supply yard) gets an address, with suggestions.
+ * Used by Schedule, Job, Request and Home.
+ */
+import { documentLabel } from "@jobly/core/equipment";
+import { daysOff, weekday } from "@jobly/core/slots";
+import { isIsoDate, localDate, localTime, parseZonedTime } from "@jobly/core/time";
+import { crewPeople, peopleAfterCrewChange, visitPeople } from "@jobly/core/visitPeople";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef, useState, type FormEvent } from "react";
+import { Link } from "react-router-dom";
+import { Button } from "@/components/ui/Button";
+import { confirm } from "@/components/ui/Confirm";
+import { Dialog } from "@/components/ui/Dialog";
+import { Field, FormChecks, FormError } from "@/components/ui/Field";
+import { Icon } from "@/components/ui/Icon";
+import { Skeleton } from "@/components/ui/Skeleton";
+import { EmptyState } from "@/components/ui/States";
+import { statusText } from "@/components/ui/StatusPill";
+import { Face } from "@/components/ui/Avatar";
+import { Select } from "@/components/ui/Select";
+import { api, supabase, unwrap, unwrapOne } from "@/lib/api";
+import { addDaysIso, formatDate, formatTime, todayIn } from "@/lib/format";
+import { shopPlace } from "@/lib/maps";
+import { useSession } from "@/lib/session";
+import { VisitChecklists } from "../jobs/FilledChecklists";
+import { VisitExtrasEditor } from "../jobs/VisitExtras";
+import { AddressSearch } from "../measure/AddressSearch";
+import { useSubSignIns } from "../subs/subsData";
+import { ChangeRequestPanel, usePendingChanges } from "./changeRequests";
+import { useSchedulingRights } from "./myCrews";
+import { doubleBookings } from "./people";
+import type { GridVisit } from "./TimeGrid";
+
+export interface VisitInput {
+  id?: string;
+  job_id?: string | null;
+  request_id?: string | null;
+  property_id?: string | null;
+  title: string;
+  kind?: string;
+  status?: string;
+  starts_at?: string | null;
+  ends_at?: string | null;
+  scheduled_on?: string | null;
+  crew_id?: string | null;
+  notes?: string | null;
+  assignee_ids?: string[];
+  /** A new visit with no set time (from the schedule's "anytime" row). */
+  anytime?: boolean;
+  /** Keep the start time when the route is organized. */
+  time_fixed?: boolean;
+  /** Shown for context, e.g. "Job #12 · Jordan Rivera". */
+  context?: { label: string; to: string } | null;
+}
+
+const STATUSES = ["scheduled", "en_route", "in_progress", "completed", "cancelled", "unscheduled"];
+const KINDS: Array<[string, string]> = [["job", "Visit for a job"], ["assessment", "Assessment"], ["task", "Task"], ["event", "Event"]];
+export const lengthLabel = (m: number) => (m < 60 ? `${m} min` : m % 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m / 60} ${m === 60 ? "hour" : "hours"}`);
+const toMin = (t: string) => {
+  const [h, m] = t.split(":").map(Number);
+  return Number.isFinite(h) && Number.isFinite(m) ? h! * 60 + m! : NaN;
+};
+const sameTime = (a: string | null | undefined, b: string | null | undefined) => (a && b ? Date.parse(a) === Date.parse(b) : (a ?? null) === (b ?? null));
+const fromMin = (m: number) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+
+interface TeamMember {
+  user_id: string;
+  role: string;
+  active: boolean;
+  profile: { full_name: string; color: string | null; avatar_url?: string | null } | null;
+}
+
+export function useDispatchOptions() {
+  const session = useSession();
+  return useQuery({
+    queryKey: ["dispatch-options", session.company.id],
+    staleTime: 5 * 60_000,
+    queryFn: async () => {
+      const [crews, members, team] = await Promise.all([
+        supabase().from("crews").select("id, name, color, lead_user_id").eq("company_id", session.company.id).eq("active", true).order("name"),
+        supabase().from("crew_members").select("crew_id, user_id").eq("company_id", session.company.id),
+        api.get<TeamMember[]>("/team"),
+      ]);
+      return { crews: unwrap(crews), crewMembers: unwrap(members), team: team.filter((m) => m.active) };
+    },
+  });
+}
+
+export function VisitDialog({ visit, onClose, onSaved }: { visit: VisitInput; onClose: () => void; onSaved?: () => void }) {
+  const session = useSession();
+  const queryClient = useQueryClient();
+  const tz = session.company.timezone;
+  const rights = useSchedulingRights();
+  const isNew = !visit.id;
+  // The office schedules everyone; a crew lead without "Schedule the whole team" runs their own crew.
+  const canDispatch = isNew ? rights.canDispatch : rights.canChange(visit.crew_id ?? null);
+  const startDate = visit.starts_at ? localDate(new Date(visit.starts_at), tz) : visit.scheduled_on ?? todayIn(tz);
+  const minutes = visit.starts_at && visit.ends_at ? Math.round((new Date(visit.ends_at).getTime() - new Date(visit.starts_at).getTime()) / 60000) : 60;
+
+  const [title, setTitle] = useState(visit.title);
+  const [kind, setKind] = useState(visit.kind ?? (visit.job_id ? "job" : "task"));
+  // A new visit from the schedule can be for any active job: pick it here.
+  const pickJob = isNew && !visit.job_id && !visit.request_id;
+  const [job, setJob] = useState<PickedJob | null>(null);
+  const [date, setDate] = useState(startDate);
+  const [anytime, setAnytime] = useState(visit.anytime ?? (!visit.starts_at && !isNew ? true : !visit.starts_at && Boolean(visit.job_id)));
+  const [time, setTime] = useState(visit.starts_at ? localTime(new Date(visit.starts_at), tz) : "08:00");
+  // The length; the end time shown is the start plus this, so moving the start keeps the length.
+  const [duration, setDuration] = useState(minutes);
+  const [timeFixed, setTimeFixed] = useState<boolean | null>(visit.time_fixed ?? (isNew ? false : null));
+  const [crewId, setCrewId] = useState(visit.crew_id ?? "");
+  const [status, setStatus] = useState(visit.status ?? "scheduled");
+  const [notes, setNotes] = useState(visit.notes ?? "");
+  const [assignees, setAssignees] = useState<string[]>(visit.assignee_ids ?? []);
+  const [slots, setSlots] = useState<Array<{ starts_at: string; ends_at: string }> | null>(null);
+  // Multi-day work: a new booking can span days (one linked visit per work day).
+  const [days, setDays] = useState(1);
+  const [skipDaysOff, setSkipDaysOff] = useState(true);
+  const skipped = skipDaysOff ? daysOff(session.company.settings) : [];
+  const [moveLater, setMoveLater] = useState(true);
+  const [equipment, setEquipment] = useState<string[] | null>(isNew ? [] : null);
+  // Null until a saved visit's address has loaded.
+  const [address, setAddress] = useState<string | null>(isNew ? "" : null);
+  const options = useDispatchOptions();
+  // A client's request from the Client Hub to move or cancel it, waiting for an answer.
+  const request = usePendingChanges(!isNew).data?.find((r) => r.visit_id === visit.id);
+  const extra = useQuery({
+    queryKey: ["visit-extra", visit.id],
+    enabled: !isNew,
+    queryFn: async () => unwrapOne(await supabase().from("visits").select("series_id, series_day, series_total, time_fixed, address, equipment:visit_equipment(equipment_id)").eq("id", visit.id!).maybeSingle(), "This visit"),
+  });
+  useEffect(() => {
+    if (extra.data && equipment === null) setEquipment(extra.data.equipment.map((e) => e.equipment_id));
+    if (extra.data && timeFixed === null) setTimeFixed(extra.data.time_fixed);
+    if (extra.data && address === null) setAddress(extra.data.address ?? "");
+  }, [extra.data, equipment, timeFixed, address]);
+  // A client's property is the address of a job's visit (and a request's, when it has one).
+  const hasAddress = !visit.property_id && !visit.job_id && kind !== "job";
+  const shop = shopPlace(session.company);
+  const series = extra.data?.series_total && extra.data.series_total > 1 ? { day: extra.data.series_day!, total: extra.data.series_total } : null;
+  const machines = useEquipmentChoices();
+  const picked = equipment ?? [];
+  // A cleared date input gives "": no start time (and nothing to save) until it's filled in again.
+  const validDate = isIsoDate(date);
+  const start = !anytime && status !== "unscheduled" ? parseZonedTime(date, time, tz) : null;
+  const endTime = Number.isFinite(toMin(time)) ? fromMin(Math.min(24 * 60 - 1, Math.max(0, toMin(time) + duration))) : "";
+  const badLength = !anytime && status !== "unscheduled" && (duration < 1 || toMin(time) + duration >= 24 * 60);
+  const clashes = useQuery({
+    queryKey: ["equipment-clash", picked.join(","), date, start?.toISOString(), duration, visit.id],
+    enabled: picked.length > 0 && status !== "unscheduled" && validDate,
+    queryFn: async () =>
+      unwrap(
+        await supabase().rpc("equipment_conflicts", {
+          p_company: session.company.id,
+          p_equipment: picked,
+          p_day: date,
+          // Anytime visits have no times: null means "any time that day".
+          p_starts: (start?.toISOString() ?? null) as string,
+          p_ends: (start ? new Date(start.getTime() + duration * 60_000).toISOString() : null) as string,
+          p_except: visit.id ?? undefined,
+        }),
+      ),
+  });
+  // Tags or an inspection sticker that will have run out by the visit's day: a warning, not a block.
+  const lapsed = useQuery({
+    queryKey: ["equipment", session.company.id, "lapsed", picked.join(","), date],
+    enabled: picked.length > 0 && status !== "unscheduled" && validDate,
+    queryFn: async () => unwrap(await supabase().from("equipment_paperwork").select("id, equipment_id, kind, name, expires_on").in("equipment_id", picked).lt("expires_on", date)),
+  });
+  const unscheduled = status === "unscheduled";
+  const crewChoices = (options.data?.crews ?? []).filter((c) => !rights.ownCrew || rights.myCrews.includes(c.id));
+  // A crew lead puts people from their own crews on a visit (and keeps anyone the office added).
+  const crewmates = new Set([
+    session.userId,
+    ...(options.data?.crewMembers ?? []).filter((m) => rights.myCrews.includes(m.crew_id)).map((m) => m.user_id),
+    ...(options.data?.crews ?? []).filter((c) => rights.myCrews.includes(c.id) && c.lead_user_id).map((c) => c.lead_user_id!),
+  ]);
+  const people = (options.data?.team ?? []).filter((m) => !rights.ownCrew || crewmates.has(m.user_id) || assignees.includes(m.user_id));
+  // Subs who can sign in, for whoever schedules the whole team: they see the visit on their own My day.
+  // One who can't sign in now (removed, or turned off) shows only while still on this visit, to take off.
+  const subSignIns = useSubSignIns(session.company.id, canDispatch && rights.wholeTeam);
+  const subs = (subSignIns.data ?? []).filter((x) => x.active || assignees.includes(x.user_id));
+  const toggle = (id: string) => setAssignees(assignees.includes(id) ? assignees.filter((x) => x !== id) : [...assignees, id]);
+  // Who's on it: the people picked or, with nobody picked, its crew's members (the same rule as the
+  // schedule's People rows, My day and who hears when it changes: visitPeople).
+  const onCrews = crewPeople(options.data?.crewMembers);
+  const onIt = visitPeople({ crew_id: crewId || null, assignees: assignees.map((user_id) => ({ user_id })) }, onCrews);
+  const crewOnIt = !assignees.length && onIt.length > 0 ? (options.data?.crews ?? []).find((c) => c.id === crewId) : undefined;
+  // Someone already on another visit at this time, as the schedule marks their row, on each day of
+  // a multi-day booking. For one day the key is the schedule's Day view's, so the board's copy is used.
+  const bookingDays = isNew && days > 1 && validDate ? workDays(date, days, skipped) : [date];
+  const lastDay = bookingDays[bookingDays.length - 1]!;
+  const sameDay = useQuery({
+    queryKey: ["schedule", session.company.id, date, lastDay, ""],
+    enabled: canDispatch && onIt.length > 0 && Boolean(start) && !badLength,
+    staleTime: 30_000,
+    queryFn: () => api.get<{ visits: Array<GridVisit & { scheduled_on: string | null; assignees: Array<{ user_id: string }> }> }>(`/schedule?from=${date}&to=${lastDay}`),
+  });
+  const draft: GridVisit = { id: visit.id ?? "new", title, kind, status, crew_id: null, starts_at: start?.toISOString() ?? null, ends_at: start ? new Date(start.getTime() + duration * 60_000).toISOString() : null };
+  const doubleBooked = !start || badLength ? [] : doubleBookings(draft, bookingDays, onIt, sameDay.data?.visits ?? [], tz, onCrews);
+  const nameOf = (id: string) => (options.data?.team ?? []).find((m) => m.user_id === id)?.profile?.full_name || subs.find((x) => x.user_id === id)?.name || "Someone";
+  // Once the crews are known, a crew lead's new visit starts on their crew, with its people.
+  useEffect(() => {
+    if (rights.ownCrew && isNew && !crewId && rights.myCrews.length && options.data) chooseCrew(rights.myCrews[0]!);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rights.ownCrew, rights.myCrews.length, options.data]);
+
+  const chooseJob = (j: PickedJob | null) => {
+    setJob(j);
+    if (!j) return;
+    if (!title.trim()) setTitle(j.title);
+    if (!crewId && j.default_crew_id) chooseCrew(j.default_crew_id);
+  };
+  const chooseCrew = (id: string) => {
+    setCrewId(id);
+    if (!options.data) return;
+    // Picking a crew for a new visit brings its people along. Changing the crew swaps the old crew's
+    // people for the new crew's and keeps anyone else picked (as the database does when a visit is
+    // dragged to another crew). A saved visit with nobody picked goes by its crew, and stays that way.
+    if (assignees.length || isNew) setAssignees(peopleAfterCrewChange(assignees, crewId || null, id || null, crewPeople(options.data.crewMembers)));
+  };
+
+  const findTime = useMutation({
+    mutationFn: () => api.post<{ slots: Array<{ starts_at: string; ends_at: string }> }>("/schedule/find-time", { date_from: date < todayIn(tz) ? todayIn(tz) : date, days: 7, duration_min: duration, crew_id: crewId || undefined }),
+    onSuccess: (r) => setSlots(r.slots),
+  });
+
+  const refresh = () => {
+    // The Jobs list and job pages say Late, Today, Upcoming or Unscheduled from the visits (public.job_state).
+    for (const key of ["schedule", "job", "jobs", "request", "dashboard", "field"]) queryClient.invalidateQueries({ queryKey: [key] });
+    // Moving it can answer a client's request to (see save).
+    queryClient.invalidateQueries({ queryKey: ["visit-changes"] });
+  };
+
+  // Toasts about a job's visits are green like jobs; an assessment's are amber like requests.
+  const tone = kind === "assessment" ? "request" : kind === "job" ? "job" : undefined;
+  const save = useMutation({
+    meta: { inline: true, tone, success: isNew ? (unscheduled ? "Added to unscheduled" : days > 1 ? `Scheduled ${days} days` : "Scheduled") : "Visit saved" },
+    mutationFn: async () => {
+      if (!title.trim()) throw new Error("Give it a title.");
+      if (!unscheduled && !validDate) throw new Error("Pick a date for the visit.");
+      const start = anytime || unscheduled ? null : parseZonedTime(date, time, tz);
+      if (!anytime && !unscheduled && !start) throw new Error("Pick a start time, or choose anytime that day.");
+      if (!anytime && !unscheduled && badLength) throw new Error("The visit has to end after it starts, before midnight.");
+      const fields = {
+        title: title.trim(),
+        scheduled_on: unscheduled ? null : date,
+        starts_at: start?.toISOString() ?? null,
+        ends_at: start ? new Date(start.getTime() + duration * 60_000).toISOString() : null,
+        crew_id: crewId || null,
+        status,
+        notes: notes.trim() || null,
+        ...(hasAddress && address !== null && { address: address.trim() || null }),
+        ...(timeFixed !== null && canDispatch && { time_fixed: Boolean(start) && timeFixed }),
+      };
+      if (!isNew) {
+        const dateChanged = fields.scheduled_on !== startDate;
+        await api.patch(`/visits/${visit.id}`, {
+          ...fields,
+          assignee_ids: canDispatch ? assignees : undefined,
+          equipment_ids: canDispatch && equipment ? equipment : undefined,
+          shift_series: Boolean(series && series.day < series.total && dateChanged && moveLater),
+        });
+        // A client asked to move it in their own words: moving it is the answer, and they're told.
+        if (request?.kind === "reschedule" && !request.scheduled_on && (dateChanged || !sameTime(fields.starts_at, visit.starts_at))) await api.post(`/visit-changes/${request.id}/approve`, {});
+        return;
+      }
+      await api.post<{ ids: string[] }>("/visits", {
+        ...fields,
+        job_id: visit.job_id ?? (kind === "job" ? job?.id ?? null : null),
+        request_id: visit.request_id ?? null,
+        property_id: visit.property_id ?? (kind === "job" ? job?.property_id ?? null : null),
+        kind: kind === "job" && !visit.job_id && !job ? "task" : kind,
+        days: unscheduled ? 1 : days,
+        skip_weekends: skipDaysOff,
+        assignee_ids: assignees,
+        equipment_ids: picked,
+      });
+      if (kind === "assessment" && visit.request_id) {
+        await supabase().from("requests").update({ status: "assessment_scheduled" }).eq("id", visit.request_id).eq("status", "new");
+      }
+    },
+    onSuccess: () => {
+      refresh();
+      onSaved?.();
+      onClose();
+    },
+  });
+  const remove = useMutation({
+    meta: { success: "Visit deleted", tone },
+    mutationFn: async () => unwrap(await supabase().from("visits").delete().eq("id", visit.id!)),
+    onSuccess: () => {
+      refresh();
+      onClose();
+    },
+  });
+
+  const heading = isNew ? (kind === "assessment" ? "Schedule an assessment" : kind === "job" ? "Schedule a visit" : kind === "event" ? "New event" : "New task") : series ? `Edit visit · day ${series.day} of ${series.total}` : "Edit visit";
+
+  return (
+    <Dialog open onClose={onClose} title={heading} description={visit.context ? <Link to={visit.context.to}>{visit.context.label}</Link> : undefined} size="lg">
+      <form onSubmit={(e: FormEvent) => { e.preventDefault(); save.mutate(); }}>
+        {request && canDispatch && <ChangeRequestPanel request={request} onAnswered={onClose} />}
+        {pickJob && (
+          <div className="segmented" role="group" aria-label="What is it?" style={{ justifySelf: "start" }}>
+            {KINDS.map(([k, l]) => <button key={k} type="button" aria-pressed={kind === k} onClick={() => setKind(k)}>{l}</button>)}
+          </div>
+        )}
+        {pickJob && kind === "job" && <JobPicker value={job} onChange={chooseJob} />}
+        <Field label="Title" requiredMessage={kind === "job" ? "Say what the crew is doing." : "Give it a title."}><input className="input" value={title} onChange={(e) => setTitle(e.target.value)} required maxLength={200} disabled={!canDispatch} placeholder={kind === "job" ? "What the crew is doing" : "Drop off estimate, supply run…"} /></Field>
+        {hasAddress && (
+          <Field label="Address" optional>
+            {address === null ? <Skeleton height={38} radius={8} /> : (
+              <AddressSearch disabled={!canDispatch} near={shop?.lat != null && shop.lng != null ? { lat: shop.lat, lng: shop.lng } : null} initial={address} onEdit={setAddress} label={null} placeholder="Search an address or a place" />
+            )}
+          </Field>
+        )}
+
+        {!unscheduled && (
+          <>
+            <div className="form-grid">
+              <Field label="Date" error={validDate ? null : "Pick a date."}><input className="input" type="date" value={date} onChange={(e) => { setDate(e.target.value); setSlots(null); }} required disabled={!canDispatch} /></Field>
+              <Field label="Starts"><input className="input" type="time" value={time} onChange={(e) => setTime(e.target.value)} disabled={anytime || !canDispatch} required={!anytime} /></Field>
+              <Field label="Ends" hint={anytime ? undefined : badLength ? undefined : lengthLabel(duration)} error={badLength ? "End after it starts." : null}>
+                <input
+                  // Also stops Schedule, and counts in "1 field needs a look", until it's fixed.
+                  ref={(el) => el?.setCustomValidity(badLength ? "End after it starts." : "")}
+                  className="input"
+                  type="time"
+                  value={anytime ? "" : endTime}
+                  onChange={(e) => {
+                    const end = toMin(e.target.value);
+                    if (Number.isFinite(end) && Number.isFinite(toMin(time))) setDuration(end - toMin(time));
+                    setSlots(null);
+                  }}
+                  disabled={anytime || !canDispatch}
+                />
+              </Field>
+            </div>
+            <div className="row-between wrap">
+              <label className="switch-row" style={{ fontWeight: 400 }}>
+                <input type="checkbox" className="switch" checked={anytime} onChange={(e) => setAnytime(e.target.checked)} disabled={!canDispatch} />
+                Anytime that day
+              </label>
+              {canDispatch && !anytime && <Button size="sm" variant="ghost" icon="search" loading={findTime.isPending} disabled={badLength} onClick={() => findTime.mutate()}>Find a time</Button>}
+            </div>
+            {!anytime && canDispatch && (
+              <label className="switch-row" style={{ fontWeight: 400 }}>
+                <input type="checkbox" className="switch" checked={Boolean(timeFixed)} onChange={(e) => setTimeFixed(e.target.checked)} />
+                <span>
+                  Fixed time
+                  <span className="muted small" style={{ display: "block", fontWeight: 400 }}>The customer expects this time. Organizing the route keeps it.</span>
+                </span>
+              </label>
+            )}
+            {slots && (
+              <div className="stack-sm">
+                <span className="muted small">{slots.length ? `Open slots for ${lengthLabel(duration)}${crewId ? " for this crew" : ""}:` : "No open slots in the next 7 days during working hours."}</span>
+                <div className="row wrap" style={{ gap: 6 }}>
+                  {slots.map((s) => {
+                    const d = localDate(new Date(s.starts_at), tz);
+                    const t = localTime(new Date(s.starts_at), tz);
+                    const active = d === date && t === time;
+                    return (
+                      <button key={s.starts_at} type="button" className="tab" aria-pressed={active} onClick={() => { setDate(d); setTime(t); }}>
+                        {new Date(s.starts_at).toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZone: tz })}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+            {isNew && canDispatch && (
+              <div className="row wrap" style={{ gap: 12, alignItems: "flex-end" }}>
+                <Field label="How many days" hint={days > 1 && validDate ? `${days} linked visits: ${workDays(date, days, skipped).map(shortDay).join(", ")}` : "Multi-day work becomes one visit per day."}>
+                  <Select className="select" value={days} onChange={(e) => setDays(Number(e.target.value))} style={{ width: 120 }}>
+                    {Array.from({ length: 14 }, (_, i) => i + 1).map((n) => <option key={n} value={n}>{n === 1 ? "1 day" : `${n} days`}</option>)}
+                  </Select>
+                </Field>
+                {days > 1 && (
+                  <label className="switch-row" style={{ fontWeight: 400, paddingBottom: 26 }}>
+                    <input type="checkbox" className="switch" checked={skipDaysOff} onChange={(e) => setSkipDaysOff(e.target.checked)} />
+                    Skip days you don't work
+                  </label>
+                )}
+              </div>
+            )}
+            {series && series.day < series.total && date !== startDate && (
+              <label className="checkbox">
+                <input type="checkbox" checked={moveLater} onChange={(e) => setMoveLater(e.target.checked)} />
+                <span>Also move day{series.total - series.day > 1 ? "s" : ""} {series.day + 1}{series.total - series.day > 1 ? `–${series.total}` : ""} by the same amount</span>
+              </label>
+            )}
+          </>
+        )}
+
+        <div className="form-grid">
+          <Field label="Crew">
+            {options.isPending ? <Skeleton height={38} radius={8} /> : (
+              <Select className="select" value={crewId} onChange={(e) => chooseCrew(e.target.value)} disabled={!canDispatch}>
+                {!rights.ownCrew && <option value="">No crew</option>}
+                {crewChoices.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </Select>
+            )}
+          </Field>
+          <Field label="Status">
+            <Select className="select" value={status} onChange={(e) => setStatus(e.target.value)}>
+              {STATUSES.map((value) => <option key={value} value={value}>{statusText("visit", value)}{value === "unscheduled" ? " (no date yet)" : ""}</option>)}
+            </Select>
+          </Field>
+        </div>
+
+        {canDispatch && (
+          <div className="field">
+            <span>People</span>
+            {options.isPending ? <Skeleton height={32} /> : !people.length ? (
+              <span className="muted small">{rights.ownCrew ? "Nobody is on your crew yet. Ask the office to add people to it in Settings → Crews." : "Invite your team in Settings to assign people."}</span>
+            ) : (
+              <div className="row wrap" style={{ gap: 6 }}>
+                {people.map((m) => {
+                  const on = assignees.includes(m.user_id);
+                  const name = m.profile?.full_name || "Team member";
+                  const locked = rights.ownCrew && !crewmates.has(m.user_id);
+                  return (
+                    <button
+                      key={m.user_id}
+                      type="button"
+                      className="tab"
+                      aria-pressed={on}
+                      disabled={locked}
+                      title={locked ? "Added by the office" : undefined}
+                      onClick={() => toggle(m.user_id)}
+                      style={{ paddingLeft: 4 }}
+                    >
+                      <span className="avatar" style={{ width: 22, height: 22, fontSize: 11, background: m.profile?.color || "var(--text-3)" }}><Face name={name} photo={m.profile?.avatar_url} /></span>
+                      {name}
+                      {on && <Icon name="check" size={12} bold />}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            {crewOnIt && <span className="muted small">Nobody picked, so everyone on {crewOnIt.name} is on it. Pick people to send only them.</span>}
+          </div>
+        )}
+        {canDispatch && subs.length > 0 && (
+          <div className="field">
+            <span>Subcontractors</span>
+            <div className="row wrap" style={{ gap: 6 }}>
+              {subs.map((x) => {
+                const on = assignees.includes(x.user_id);
+                // Can't sign in now: it can come off the visit, not go back on.
+                const off = !x.active;
+                return (
+                  <button key={x.user_id} type="button" className="tab" aria-pressed={on} disabled={off && !on}
+                    title={off ? "Can't sign in now. Tap to take them off this visit." : [x.contact_name, x.trade].filter(Boolean).join(" · ") || undefined}
+                    onClick={() => toggle(x.user_id)} style={{ paddingLeft: 4 }}>
+                    <span className="avatar" style={{ width: 22, height: 22, fontSize: 11, background: "var(--text-3)" }}><Face name={x.name} /></span>
+                    {x.name}
+                    {off && <span className="muted small">Can't sign in now</span>}
+                    {on && <Icon name="check" size={12} bold />}
+                  </button>
+                );
+              })}
+            </div>
+            <span className="muted small">It shows on their phone with the address and the work. Not your prices, and not your client's phone or email unless you allow it on their page.</span>
+          </div>
+        )}
+        {canDispatch && doubleBooked.length > 0 && (
+          <div className="callout callout-warning">
+            <Icon name="alert" size={16} />
+            <div className="grow small" style={{ fontWeight: 400 }}>
+              {doubleBooked.map(({ id, clashes }) => (
+                <div key={id}>
+                  <strong>{nameOf(id)}</strong> is also on {clashes.map((c) => `${c.title} (${bookingDays.length > 1 ? `${shortDay(c.day)}, ` : ""}${formatTime(c.starts_at!, tz)}${c.ends_at ? `–${formatTime(c.ends_at, tz)}` : ""})`).join(", ")}.
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {canDispatch && machines.data && machines.data.length > 0 && (
+          <div className="field">
+            <span>Equipment</span>
+            <div className="row wrap" style={{ gap: 6 }}>
+              {machines.data.map((m) => {
+                const on = picked.includes(m.id);
+                const shop = m.status === "in_shop";
+                return (
+                  <button key={m.id} type="button" className="tab" aria-pressed={on} disabled={shop && !on} title={shop ? "In the shop" : undefined} onClick={() => setEquipment(on ? picked.filter((x) => x !== m.id) : [...picked, m.id])}>
+                    <Icon name="truck" size={14} />
+                    {m.name}{shop ? " (in the shop)" : ""}
+                    {on && <Icon name="check" size={12} bold />}
+                  </button>
+                );
+              })}
+            </div>
+            {!!clashes.data?.length && (
+              <div className="callout callout-warning" style={{ marginTop: 6 }}>
+                <Icon name="alert" size={16} />
+                <div className="grow small" style={{ fontWeight: 400 }}>
+                  {clashes.data.map((cl) => (
+                    <div key={`${cl.equipment_id}-${cl.visit_id}`}>
+                      <strong>{machines.data.find((m) => m.id === cl.equipment_id)?.name}</strong> is also booked on {cl.title}{cl.starts_at ? ` (${new Date(cl.starts_at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: tz })}${cl.ends_at ? `–${new Date(cl.ends_at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: tz })}` : ""})` : " that day"}.
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {!!lapsed.data?.length && (
+              <div className="callout callout-warning" style={{ marginTop: 6 }}>
+                <Icon name="alert" size={16} />
+                <div className="grow small" style={{ fontWeight: 400 }}>
+                  {lapsed.data.map((p) => (
+                    <div key={p.id}>
+                      <strong>{machines.data.find((m) => m.id === p.equipment_id)?.name}</strong>: {documentLabel(p.kind ?? "", p.name)} is good only through {formatDate(p.expires_on)}.
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        <Field label="Instructions for the crew" optional><textarea className="textarea" value={notes} onChange={(e) => setNotes(e.target.value)} maxLength={5000} /></Field>
+        {visit.id && <VisitChecklists visitId={visit.id} />}
+        {/* A repeating job's visit: work done on it alone, billed once with it. Saved as it's added, apart from the form. */}
+        {visit.id && visit.job_id && (visit.kind ?? "job") === "job" && <VisitExtrasEditor visitId={visit.id} jobId={visit.job_id} onChanged={onSaved} />}
+        <p className="muted small" style={{ margin: 0 }}>Times are in {tz.replace(/_/g, " ")}.</p>
+        <FormError error={save.error} />
+        <div className="form-actions">
+          <FormChecks />
+          {!isNew && canDispatch && (
+            <Button
+              variant="danger"
+              icon="trash"
+              loading={remove.isPending}
+              onClick={async () => {
+                if (await confirm({ title: "Delete this visit?", body: "Time logged against it is kept.", confirmLabel: "Delete visit", danger: true })) remove.mutate();
+              }}
+            >
+              Delete
+            </Button>
+          )}
+          <span className="spacer" />
+          <Button onClick={onClose}>Cancel</Button>
+          <Button type="submit" variant="primary" loading={save.isPending}>{isNew ? (unscheduled ? "Add to unscheduled" : "Schedule") : "Save"}</Button>
+        </div>
+      </form>
+    </Dialog>
+  );
+}
+
+interface PickedJob {
+  id: string;
+  number: number;
+  title: string;
+  property_id: string | null;
+  default_crew_id: string | null;
+  client: { display_name: string } | null;
+}
+
+/** Search the active jobs and pick one. */
+function JobPicker({ value, onChange }: { value: PickedJob | null; onChange: (job: PickedJob | null) => void }) {
+  const session = useSession();
+  const [term, setTerm] = useState("");
+  const search = useRef<HTMLInputElement>(null);
+  // Until a job is picked, the search box is what the form checks, so Schedule says to pick one.
+  useEffect(() => search.current?.setCustomValidity("Pick the job this visit is for."));
+  const jobs = useQuery({
+    queryKey: ["jobs", session.company.id, "visit-picker"],
+    staleTime: 60_000,
+    queryFn: async () =>
+      unwrap(
+        await supabase()
+          .from("jobs")
+          .select("id, number, title, property_id, default_crew_id, client:clients(display_name)")
+          .eq("company_id", session.company.id)
+          .in("status", ["active", "requires_invoicing"])
+          .order("created_at", { ascending: false })
+          .limit(500),
+      ) as PickedJob[],
+  });
+  if (value) {
+    return (
+      <div className="field">
+        <span>Job</span>
+        <div className="row" style={{ gap: 8, padding: "8px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)" }}>
+          <Icon name="job" size={16} />
+          <span className="grow" style={{ minWidth: 0 }}>
+            <strong>{value.title}</strong>
+            <span className="muted small" style={{ display: "block" }}>Job #{value.number}{value.client ? ` · ${value.client.display_name}` : ""}</span>
+          </span>
+          <Button size="sm" variant="ghost" onClick={() => onChange(null)}>Change</Button>
+        </div>
+      </div>
+    );
+  }
+  const q = term.trim().toLowerCase();
+  const matches = (jobs.data ?? []).filter((j) => !q || `${j.title} ${j.client?.display_name ?? ""} #${j.number}`.toLowerCase().includes(q)).slice(0, 6);
+  return (
+    <Field label="Job">
+      <input ref={search} className="input" placeholder="Search by job, client or number" value={term} onChange={(e) => setTerm(e.target.value)} aria-label="Search jobs" autoFocus />
+      <div className="card" style={{ boxShadow: "none" }}>
+        {jobs.isPending && <div className="card-row"><Skeleton width="60%" /></div>}
+        {matches.map((j) => (
+          <button key={j.id} type="button" className="card-row" style={{ width: "100%", border: 0, background: "transparent", textAlign: "left", cursor: "pointer", font: "inherit" }} onClick={() => onChange(j)}>
+            <span className="grow" style={{ minWidth: 0 }}>
+              <strong>{j.title}</strong>
+              <span className="muted small" style={{ display: "block" }}>Job #{j.number}{j.client ? ` · ${j.client.display_name}` : ""}</span>
+            </span>
+          </button>
+        ))}
+        {jobs.data && !matches.length && (jobs.data.length ? <EmptyState inline title="No jobs match" /> : <EmptyState inline title="No active jobs yet">Turn a quote into a job first, or schedule a task.</EmptyState>)}
+      </div>
+    </Field>
+  );
+}
+
+/** Equipment that can go out on a visit (not retired), for the visit's equipment picker. */
+function useEquipmentChoices() {
+  const session = useSession();
+  return useQuery({
+    queryKey: ["equipment-choices", session.company.id],
+    staleTime: 5 * 60_000,
+    queryFn: async () => unwrap(await supabase().from("equipment").select("id, name, kind, status").eq("company_id", session.company.id).neq("status", "retired").order("name")),
+  });
+}
+
+/** The dates a multi-day booking lands on, past the days in `skip` (daysOff()), the same way the API picks them. */
+export function workDays(first: string, count: number, skip: readonly number[]): string[] {
+  const out: string[] = [];
+  for (let d = first; out.length < count; d = addDaysIso(d, 1)) {
+    if (count > 1 && out.length > 0 && skip.includes(weekday(d))) continue;
+    out.push(d);
+  }
+  return out;
+}
+const shortDay = (d: string) => new Date(`${d}T12:00:00Z`).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });

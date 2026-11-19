@@ -1,0 +1,191 @@
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useDeferredValue, useEffect, useState } from "react";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { Button } from "@/components/ui/Button";
+import { ClientLink } from "@/components/ui/ClientPreview";
+import { Icon } from "@/components/ui/Icon";
+import { PageHeader } from "@/components/ui/PageHeader";
+import { ListPageSkeleton } from "@/components/ui/Skeleton";
+import { EmptyState, ErrorState } from "@/components/ui/States";
+import { EntityStatus, statusText } from "@/components/ui/StatusPill";
+import { api, searchTerm, supabase } from "@/lib/api";
+import { formatDate, timeAgo } from "@/lib/format";
+import { titleOrClientFilter, useStatusCounts } from "@/lib/listing";
+import { firstRows } from "@/lib/paging";
+import { can, hasRole, useSession, type Session } from "@/lib/session";
+import { askedFor, BookAskedTime } from "./AskedTime";
+import { NewRequestDialog } from "./NewRequestDialog";
+
+// A tab for one status says it as the status pill does.
+const FILTERS = [
+  { key: "open", label: "Open", statuses: ["new", "assessment_scheduled", "assessment_complete"] },
+  { key: "new", label: statusText("request", "new"), statuses: ["new"] },
+  { key: "assessment", label: "Assessments", statuses: ["assessment_scheduled", "assessment_complete"] },
+  { key: "done", label: "Quoted or converted", statuses: ["quoted", "converted"] },
+  { key: "archived", label: statusText("request", "archived"), statuses: ["archived"] },
+] as const;
+type FilterKey = (typeof FILTERS)[number]["key"];
+/** How many requests the list shows at first, and how many more each "Load more" brings. */
+const PAGE = 200;
+
+/**
+ * The first `limit` requests with some statuses, newest first, and how many there are in all
+ * (`total`). `term` narrows them to a request number, or a title or client that has it;
+ * `fromWebsite` to the ones a website form sent.
+ */
+export async function loadRequests({ companyId, statuses, term, fromWebsite }: { companyId: string; statuses: readonly string[]; term: string; fromWebsite: boolean }, limit: number) {
+  const match = term && !/^\d+$/.test(term) ? await titleOrClientFilter(companyId, term) : null;
+  const { rows, total } = await firstRows(
+    () => {
+      let q = supabase()
+        .from("requests")
+        .select("id, number, title, status, source, website_form_id, assigned_to, created_at, asked_starts_at, asked_ends_at, client:clients(id, display_name), property:properties(line1, city)", { count: "exact" })
+        .eq("company_id", companyId)
+        .in("status", [...statuses]);
+      if (fromWebsite) q = q.not("website_form_id", "is", null);
+      if (term) q = match ? q.or(match) : q.eq("number", Number(term));
+      return q;
+    },
+    limit,
+    { order: { column: "created_at", ascending: false } },
+  );
+  return { rows, total: total ?? rows.length };
+}
+
+export const REQUEST_SOURCES: Record<string, string> = { web_form: "Booking form", phone: "Phone", email: "Email", hub: "Client Hub", manual: "In person", assistant: "AI assistant", referral: "Referral" };
+
+/** Where a request came from, as people say it: a message from a website form (Apps → Website Forms) is a web_form request too. */
+export const requestSource = (r: { source: string; website_form_id?: string | null }) => (r.website_form_id ? "Website form" : (REQUEST_SOURCES[r.source] ?? r.source));
+
+/** The team, for who a request is assigned to (the same list as Settings → People). */
+export interface TeamMember { user_id: string; role: string; active: boolean; profile: { full_name: string; email?: string | null } | null }
+export const useTeam = (companyId: string) => useQuery({ queryKey: ["team", companyId], staleTime: 5 * 60_000, queryFn: () => api.get<TeamMember[]>("/team") });
+export const memberName = (m: TeamMember | undefined) => (m ? m.profile?.full_name || m.profile?.email || "Team member" : null);
+
+/** Who can log a request: the roles the database lets add one (requests_insert). */
+export const canLogRequests = (session: Pick<Session, "role">) => hasRole(session, "admin", "office", "estimator");
+
+export function RequestsPage() {
+  const session = useSession();
+  const navigate = useNavigate();
+  const [params, setParams] = useSearchParams();
+  const [filter, setFilter] = useState<FilterKey>(() => (FILTERS.find((x) => x.key === params.get("status"))?.key as FilterKey | undefined) ?? "open");
+  const [search, setSearch] = useState("");
+  const term = useDeferredValue(searchTerm(search));
+  // ?new=1 opens the form only for people who can log a request: the installed app's "New request"
+  // shortcut is on everyone's phone, and the crew get Requests without a form they can't save.
+  const creating = params.get("new") === "1" && canLogRequests(session);
+  // ?from=website: only messages from website forms (Apps → Website Forms opens Requests this way).
+  const fromWebsite = params.get("from") === "website";
+  const setParam = (name: string, value: string | null) =>
+    setParams((p) => {
+      const next = new URLSearchParams(p);
+      if (value === null) next.delete(name);
+      else next.set(name, value);
+      return next;
+    }, { replace: true });
+  const setCreating = (on: boolean) => setParam("new", on ? "1" : null);
+  const statuses = FILTERS.find((f) => f.key === filter)!.statuses;
+  const canSell = hasRole(session, "admin", "office", "estimator") && can(session, "sales");
+  const counts = useStatusCounts("requests", session.company.id, Object.fromEntries(FILTERS.map((f) => [f.key, f.statuses])));
+  const team = useTeam(session.company.id);
+
+  const [limit, setLimit] = useState(PAGE);
+  useEffect(() => setLimit(PAGE), [filter, term, fromWebsite]);
+
+  const requests = useQuery({
+    queryKey: ["requests", session.company.id, filter, term, fromWebsite, limit],
+    placeholderData: keepPreviousData,
+    queryFn: () => loadRequests({ companyId: session.company.id, statuses, term, fromWebsite }, limit),
+  });
+
+  if (requests.isPending) return <ListPageSkeleton columns={6} tabs={5} />;
+  const rows = requests.data?.rows ?? [];
+  const total = requests.data?.total ?? 0;
+
+  return (
+    <>
+      <PageHeader
+        title="Requests"
+        actions={
+          <>
+            {canSell && <Link to="/pipeline" className="btn"><Icon name="pipeline" size={16} />Sales board</Link>}
+            {canSell && <Button variant="primary" icon="plus" onClick={() => setCreating(true)}>New request</Button>}
+          </>
+        }
+      />
+      <div className="toolbar">
+        <div className="input-group">
+          <span className="addon"><Icon name="search" size={16} /></span>
+          <input className="input" type="search" placeholder="Search by client or #number" value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search requests" />
+        </div>
+        <div className="tabs" role="group" aria-label="Filter requests">
+          {FILTERS.map((f) => (
+            <button key={f.key} type="button" className="tab" aria-pressed={filter === f.key} onClick={() => setFilter(f.key)}>
+              {f.label}
+              {counts.data && !fromWebsite && <span className="badge">{counts.data[f.key]}</span>}
+            </button>
+          ))}
+        </div>
+        {fromWebsite && (
+          <button type="button" className="chip" aria-label="Show requests from everywhere" onClick={() => setParam("from", null)}>
+            From website forms <Icon name="x" size={12} />
+          </button>
+        )}
+      </div>
+      {requests.error && !requests.data ? (
+        <div className="card"><ErrorState error={requests.error} onRetry={() => requests.refetch()} /></div>
+      ) : rows.length === 0 ? (
+        <div className="card">
+          {term ? (
+            <EmptyState icon="search" title="No requests match" action={<Button onClick={() => setSearch("")}>Clear search</Button>} />
+          ) : fromWebsite ? (
+            <EmptyState icon="requests" title="Nothing from your website forms here" action={<Button onClick={() => setParam("from", null)}>Show everything</Button>}>
+              Messages people send with your website's forms show up here as they arrive.
+            </EmptyState>
+          ) : (
+            <EmptyState icon="requests" title={filter === "open" ? "No open requests" : "Nothing here"} action={canSell && filter === "open" && (<><Button icon="plus" onClick={() => setCreating(true)}>New request</Button><Link className="btn" to="/booking">Set up online booking</Link></>)}>
+              {filter === "open" ? "Requests from your booking and website forms, the Client Hub and referrals land here, along with ones you log by phone." : "No requests have this status."}
+            </EmptyState>
+          )}
+        </div>
+      ) : (
+        <div className={`card${requests.isPlaceholderData ? " is-stale" : ""}`}>
+          <table className="table table-stack">
+            <thead><tr><th>#</th><th>Request</th><th>Client</th><th>Salesperson</th><th>Received</th><th>Status</th></tr></thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.id} className="row-link" onClick={() => navigate(`/requests/${r.id}`)}>
+                  <td className="muted tabular" style={{ width: 56 }}>#{r.number}</td>
+                  <td>
+                    <Link className="cell-link" to={`/requests/${r.id}`} onClick={(e) => e.stopPropagation()}>{r.title}</Link>
+                    <div className="muted small">{requestSource(r)}{r.property ? ` · ${r.property.line1}` : ""}</div>
+                    {/* A time picked online that waits for the office's OK, with one press to book it. */}
+                    {askedFor(r, session.company.timezone) && (
+                      <div className="row wrap small" style={{ gap: 8, marginTop: 4 }}>
+                        <strong>Asked for {askedFor(r, session.company.timezone)}</strong>
+                        {canSell && <BookAskedTime request={r} size="sm" />}
+                      </div>
+                    )}
+                  </td>
+                  <td>{r.client ? <ClientLink id={r.client.id} name={r.client.display_name} /> : <span className="muted">—</span>}</td>
+                  <td>{memberName(team.data?.find((m) => m.user_id === r.assigned_to)) ?? <span className="muted">—</span>}</td>
+                  <td title={formatDate(r.created_at)}>
+                    {timeAgo(r.created_at)}
+                    {r.status === "new" && Date.now() - Date.parse(r.created_at) > 2 * 86_400_000 && <div className="small text-danger strong">Waiting over 2 days</div>}
+                  </td>
+                  <td><EntityStatus kind="request" status={r.status} /></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="list-foot">
+            <span>{rows.length < total ? `Showing ${rows.length} of ${total}` : `${rows.length} ${rows.length === 1 ? "request" : "requests"}`}</span>
+            {rows.length < total && <Button size="sm" loading={requests.isFetching} onClick={() => setLimit((l) => l + PAGE)}>Load more</Button>}
+          </div>
+        </div>
+      )}
+      <NewRequestDialog open={creating} onClose={() => setCreating(false)} onCreated={(id) => { setCreating(false); navigate(`/requests/${id}`); }} />
+    </>
+  );
+}

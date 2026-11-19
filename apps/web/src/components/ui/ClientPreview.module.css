@@ -1,0 +1,33 @@
+/* A client's name in a list (ClientLink): the text around it, until it's pointed at. */
+.link { color: inherit; font-weight: inherit; }
+.link:hover, .link[data-popup-open] { color: var(--green-dark); text-decoration: underline; text-underline-offset: 2px; }
+
+/* A client's preview card (ClientPreview.tsx): drops in like a menu, and lifts away quicker. */
+.positioner { z-index: 50; }
+
+.card {
+  width: 288px; max-width: calc(100vw - 32px); padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius-card);
+  background: var(--surface); box-shadow: var(--shadow-md); color: var(--ink); font-size: var(--fs-13);
+  display: grid; gap: 8px; transform-origin: var(--transform-origin);
+  transition: opacity var(--dur) var(--ease-enter), transform var(--dur) var(--ease-enter);
+}
+.card[data-starting-style], .card[data-ending-style] { opacity: 0; transform: translateY(-4px) scale(0.97); }
+.card[data-ending-style] { transition-duration: 140ms; transition-timing-function: var(--ease-exit); }
+
+.head { display: grid; gap: 1px; min-width: 0; }
+.name { font-size: var(--fs-14); font-weight: 700; overflow-wrap: anywhere; }
+.company { color: var(--text-3); overflow-wrap: anywhere; }
+
+.lines { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.line { display: flex; align-items: flex-start; gap: 8px; min-width: 0; overflow-wrap: anywhere; }
+.line svg { flex: none; margin-top: 1px; color: var(--text-3); }
+
+.foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-top: 8px; border-top: 1px solid var(--divider); }
+.owed { font-weight: 700; font-variant-numeric: tabular-nums; }
+.owed[data-due] { color: var(--danger); }
+.settled { color: var(--text-3); }
+.open { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; font-weight: 700; }
+
+@media (prefers-reduced-motion: reduce) {
+  .card[data-starting-style], .card[data-ending-style] { transform: none; }
+}

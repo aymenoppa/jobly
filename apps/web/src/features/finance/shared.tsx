@@ -1,0 +1,135 @@
+/**
+ * What Finance and Metrics share: the date range in the address bar and its picker, the tab bar,
+ * and the loading and error wrapper around a tab.
+ */
+import { useQuery } from "@tanstack/react-query";
+import type { ReactNode } from "react";
+import { useSearchParams } from "react-router-dom";
+import { Icon } from "@/components/ui/Icon";
+import { Select } from "@/components/ui/Select";
+import { PageHeader } from "@/components/ui/PageHeader";
+import { CardSkeleton, Loading, Skeleton } from "@/components/ui/Skeleton";
+import { ErrorState } from "@/components/ui/States";
+import { api } from "@/lib/api";
+import { formatNumber, todayIn } from "@/lib/format";
+import { useSession } from "@/lib/session";
+import { PRESETS, resolveRange, shortDate, type PresetKey, type Range } from "./range";
+
+export interface TeamMember { user_id: string; labor_rate: number | null; active: boolean; profile: { full_name: string; color: string | null } | null; sub?: { id: string; name: string } }
+export { memberName } from "../subs/memberName";
+
+export { timeRates, type Rates } from "./jobCosts";
+
+export const pct = (n: number, d: number) => (d > 0 ? `${Math.round((n / d) * 100)}%` : "—");
+export const hrs = (n: number) => (n > 0 && n < 1 ? `${Math.max(1, Math.round(n * 60))} min` : `${formatNumber(n, n < 10 && n % 1 ? 1 : 0)} h`);
+export const sum = <T,>(rows: T[], f: (r: T) => number) => rows.reduce((s, r) => s + (f(r) || 0), 0);
+export const plural = (n: number, one: string, many = `${one}s`) => `${formatNumber(n)} ${n === 1 ? one : many}`;
+
+export function useTeam() {
+  const session = useSession();
+  // Subs too: one the office keeps hours for has time in these reports (GET /team?with_subs=1).
+  return useQuery({ queryKey: ["team", session.company.id, "with-subs"], staleTime: 5 * 60_000, queryFn: () => api.get<TeamMember[]>("/team?with_subs=1") });
+}
+
+/** The date range (and tab) kept in the address bar, so a view can be bookmarked or shared. */
+export function useRangeParams() {
+  const session = useSession();
+  const [params, setParams] = useSearchParams();
+  const tz = session.company.timezone;
+  const today = todayIn(tz);
+  const presetKey = (PRESETS.find((p) => p.key === params.get("range"))?.key ?? "month") as PresetKey;
+  const range = resolveRange(presetKey, today, tz, { from: params.get("from"), to: params.get("to") });
+  const update = (patch: Record<string, string | null>) => {
+    const next = new URLSearchParams(params);
+    for (const [k, v] of Object.entries(patch)) v === null ? next.delete(k) : next.set(k, v);
+    setParams(next, { replace: true });
+  };
+  return { params, today, presetKey, range, update };
+}
+export type RangeParams = ReturnType<typeof useRangeParams>;
+
+/** Carries the date range to another page's address: "range=month", or a custom range's dates. */
+export const rangeQuery = (range: Range) => (range.key === "custom" ? `range=custom&from=${range.from}&to=${range.to}` : `range=${range.key}`);
+
+/** The date range picker: a preset, or two dates for a custom range. */
+export function RangePicker({ state }: { state: RangeParams }) {
+  const { presetKey, range, update } = state;
+  return (
+    <div className="row wrap" style={{ gap: 8 }}>
+      <label className="select-pill range-pill">
+        <Icon name="calendar" size={14} />
+        <span className="range-pill-label">Date range</span>
+        <Select className="select-plain" value={presetKey} onChange={(e) => update(e.target.value === "custom" ? { range: "custom", from: range.from, to: range.to } : { range: e.target.value, from: null, to: null })}>
+          {PRESETS.map((p) => <option key={p.key} value={p.key}>{p.label}</option>)}
+        </Select>
+        <Icon name="chevronDown" size={14} />
+      </label>
+      {presetKey === "custom" && (
+        <div className="row" style={{ gap: 6 }}>
+          <input className="input" type="date" value={range.from} max={range.to} onChange={(e) => e.target.value && update({ from: e.target.value })} aria-label="From" style={{ width: 150 }} />
+          <span className="muted">to</span>
+          <input className="input" type="date" value={range.to} min={range.from} onChange={(e) => e.target.value && update({ to: e.target.value })} aria-label="To" style={{ width: 150 }} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The range in words: "Oct 1 – Oct 20 · 20 days", with the year when it isn't this one. */
+export function rangeWords(range: Range, today: string): string {
+  const year = range.to.slice(0, 4) !== today.slice(0, 4) || range.from.slice(0, 4) !== today.slice(0, 4) ? `, ${range.to.slice(0, 4)}` : "";
+  return `${shortDate(range.from)}${range.from !== range.to ? ` – ${shortDate(range.to)}` : ""}${year} · ${plural(range.days, "day")}`;
+}
+
+/** The page title with its date range picker, the range in words, and the tab bar. */
+export function RangeHeader<K extends string>({ title, state, tabs, tab }: { title: string; state: RangeParams; tabs: ReadonlyArray<{ key: K; label: string }>; tab: K }) {
+  const { range, today, update } = state;
+  const first = tabs[0]?.key;
+  return (
+    <>
+      <PageHeader title={title} actions={<RangePicker state={state} />} />
+      <p className="page-subtitle">{rangeWords(range, today)}</p>
+      <div className="underline-tabs" role="tablist" aria-label={title}>
+        {tabs.map((t) => <button key={t.key} type="button" role="tab" aria-selected={tab === t.key} onClick={() => update({ tab: t.key === first ? null : t.key })}>{t.label}</button>)}
+      </div>
+    </>
+  );
+}
+
+export interface Loaded<T> { data: T | undefined; error: unknown; isPlaceholderData: boolean; refetch: () => unknown }
+
+/** Two queries shown as one: loaded when both are. */
+export function both<A, B>(a: Loaded<A>, b: Loaded<B>): Loaded<[A, B]> {
+  return {
+    data: a.data !== undefined && b.data !== undefined ? [a.data, b.data] : undefined,
+    error: a.error ?? b.error,
+    isPlaceholderData: a.isPlaceholderData || b.isPlaceholderData,
+    refetch: () => Promise.all([a.refetch(), b.refetch()]),
+  };
+}
+
+/** Shared loading/error/stale wrapper for a tab's queries. */
+export function TabBody<T>({ query, skeleton, children }: { query: Loaded<T>; skeleton?: ReactNode; children: (data: T) => ReactNode }) {
+  if (query.error && !query.data) return <div className="card"><ErrorState error={query.error} onRetry={() => query.refetch()} /></div>;
+  if (!query.data)
+    return (
+      <Loading label="Loading figures" className="stack">
+        {skeleton ?? (
+          <>
+            <div className="card kpi-strip" aria-hidden>{[0, 1, 2, 3].map((i) => <div key={i} className="kpi" style={{ display: "grid", gap: 10 }}><Skeleton width="55%" height={10} /><Skeleton width="70%" height={22} /></div>)}</div>
+            <div className="report-grid"><CardSkeleton height={240} /><CardSkeleton lines={5} /></div>
+          </>
+        )}
+      </Loading>
+    );
+  return <div className={`stack${query.isPlaceholderData ? " is-stale" : ""}`} style={{ gap: 28 }}>{children(query.data)}</div>;
+}
+
+export function SectionHead({ title, id, children }: { title: string; id?: string; children?: ReactNode }) {
+  return (
+    <div className="fin-section-head">
+      <h2 id={id}>{title}</h2>
+      {children}
+    </div>
+  );
+}

@@ -1,0 +1,117 @@
+/**
+ * The AI assistants a person has connected to Jobly (their grants on Supabase Auth's OAuth
+ * server), and what each may change (public.assistant_connections; the rules are in
+ * packages/core/src/assistants.ts). A connection with no row only reads: that includes every one
+ * made before access could be chosen.
+ */
+import { toAssistantAccess, type AssistantAccess } from "@jobly/core/assistants";
+import type { Database } from "@jobly/core/database";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import chatgptLogo from "@/assets/apps/chatgpt.svg";
+import claudeLogo from "@/assets/apps/claude.svg";
+import codexLogo from "@/assets/apps/codex.svg";
+import { api, ApiError, unwrap } from "@/lib/api";
+
+type Db = SupabaseClient<Database>;
+
+/**
+ * The real logo for the assistants we know, by the name each signs up with ("Codex", "Claude",
+ * "Claude Code", "ChatGPT"): most don't send one, and then the card showed just a letter.
+ */
+export function assistantLogo(name: string): string | null {
+  if (/\bcodex\b/i.test(name)) return codexLogo;
+  if (/\bclaude\b/i.test(name)) return claudeLogo;
+  if (/\b(chatgpt|openai)\b/i.test(name)) return chatgptLogo;
+  return null;
+}
+
+/** Where each assistant keeps its connector settings, after copying the link. */
+export const CONNECTOR_STEPS: Record<string, string[]> = {
+  anthropic: ["In Claude, open Settings, then Connectors.", "Choose Add custom connector and paste the link above.", "Sign in with your Jobly account when Claude asks."],
+  chatgpt: ["In ChatGPT, open Settings, then Apps and connectors.", "With developer mode on, add a connector and paste the link above.", "Sign in with your Jobly account when ChatGPT asks."],
+};
+
+export interface AssistantConnection {
+  clientId: string;
+  name: string;
+  logo: string | null;
+  connectedAt: string;
+  access: AssistantAccess;
+}
+
+/** This person's connected assistants, newest first. */
+export async function loadConnections(db: Db): Promise<AssistantConnection[]> {
+  const { data: grants, error } = await db.auth.oauth.listGrants();
+  // Auth's OAuth server is off (a Supabase project can have it off): nothing can be connected.
+  if (error?.code === "feature_disabled") return [];
+  if (error) throw new ApiError("Your connected assistants couldn't be loaded. Try again in a moment.", error.status ?? 500);
+  const rows = unwrap(await db.from("assistant_connections").select("client_id, level, areas"));
+  const access = new Map(rows.map((r) => [r.client_id, toAssistantAccess(r)]));
+  return grants
+    .map((g) => {
+      const name = g.client.name?.trim() || "AI assistant";
+      return {
+        clientId: g.client.id,
+        name,
+        logo: assistantLogo(name) ?? (g.client.logo_uri || null),
+        connectedAt: g.granted_at,
+        access: access.get(g.client.id) ?? toAssistantAccess(null),
+      };
+    })
+    .sort((a, b) => b.connectedAt.localeCompare(a.connectedAt));
+}
+
+/** One assistant someone on the team connected, as the owner sees it. */
+export interface TeamConnection extends AssistantConnection {
+  userId: string;
+  person: string;
+}
+
+/** A row of GET /assistants/connections (the server's teamConnections). */
+export interface TeamConnectionRow {
+  user_id: string;
+  full_name: string;
+  client_id: string;
+  name: string;
+  logo: string | null;
+  connected_at: string;
+  access: AssistantAccess;
+}
+
+export const toTeamConnection = (r: TeamConnectionRow): TeamConnection => ({
+  userId: r.user_id,
+  person: r.full_name,
+  clientId: r.client_id,
+  name: r.name,
+  logo: assistantLogo(r.name) ?? (r.logo || null),
+  connectedAt: r.connected_at,
+  access: toAssistantAccess(r.access),
+});
+
+/**
+ * Every assistant the team has connected, newest first. The owner's alone: people see only their
+ * own in the database, so the server reads these for an owner who asks.
+ */
+export async function loadTeamConnections(): Promise<TeamConnection[]> {
+  return (await api.get<{ connections: TeamConnectionRow[] }>("/assistants/connections")).connections.map(toTeamConnection);
+}
+
+/** The owner ends one of them, as the person's own Disconnect does. */
+export async function endTeamConnection(connection: Pick<TeamConnection, "userId" | "clientId">): Promise<void> {
+  await api.post("/assistants/connections/end", { user_id: connection.userId, client_id: connection.clientId });
+}
+
+export async function setAccess(db: Db, userId: string, clientId: string, access: AssistantAccess): Promise<void> {
+  const areas = access.level === "areas" ? access.areas : [];
+  unwrap(await db.from("assistant_connections").upsert({ user_id: userId, client_id: clientId, level: access.level, areas }, { onConflict: "user_id,client_id" }));
+}
+
+/**
+ * Takes away its access first, then the connection itself: if that second step doesn't get
+ * through, the assistant can still only read. Connected again later, it starts out reading only.
+ */
+export async function disconnect(db: Db, clientId: string): Promise<void> {
+  unwrap(await db.from("assistant_connections").delete().eq("client_id", clientId));
+  const { error } = await db.auth.oauth.revokeGrant({ clientId });
+  if (error) throw new ApiError("It couldn't be disconnected. It can only read now; try again in a moment.", error.status ?? 500);
+}
