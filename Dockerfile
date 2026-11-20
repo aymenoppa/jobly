@@ -1,0 +1,37 @@
+# Jobly: web app, API and background tasks in one container. In a Jobly instance (Railway
+# template or docker-compose.yml) it's also the gateway to the instance's Supabase services and
+# applies database migrations as it starts. See deploy/README.md.
+#   docker compose up        the whole instance, locally
+#   docker build -t jobly .
+
+# The base image is pinned to one exact build (the part after @), so a release is built on the image
+# that was tested, not on whatever node:22-alpine points at that day. To move to a newer one:
+#   docker pull node:22-alpine && docker inspect --format '{{index .RepoDigests 0}}' node:22-alpine
+# then put the sha256 it prints in both FROM lines, and build and test the image before releasing.
+FROM node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a AS build
+WORKDIR /src
+COPY package.json package-lock.json ./
+COPY apps/web/package.json apps/web/
+COPY apps/api/package.json apps/api/
+COPY packages/core/package.json packages/core/
+RUN npm ci --no-audit --no-fund
+COPY . .
+# The web build (the Word editor's bundle and its source map especially) needs more than Node's
+# default heap in a container.
+RUN NODE_OPTIONS=--max-old-space-size=4096 npm run build:server
+
+FROM node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a
+WORKDIR /app
+# The release this image is (set by .github/workflows/release.yml); /api/health reports it.
+ARG JOBLY_VERSION=dev
+ENV NODE_ENV=production PORT=8080 JOBLY_VERSION=$JOBLY_VERSION
+# pg_dump and pg_restore, for the nightly database backup and scripts/restore.mjs. The same major
+# version as the db service (deploy/postgres): pg_dump refuses a server newer than itself.
+RUN apk add --no-cache postgresql17-client
+COPY --from=build --chown=node:node /src/dist/server ./
+COPY --from=build --chown=node:node /src/LICENSE /src/NOTICE /src/TERMS ./
+USER node
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s CMD wget -qO- "http://127.0.0.1:${PORT}/api/health" >/dev/null || exit 1
+# Applies pending migrations itself (when SUPABASE_DB_URL is set), then starts background tasks.
+CMD ["node", "server.mjs"]

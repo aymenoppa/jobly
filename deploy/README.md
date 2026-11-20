@@ -1,0 +1,269 @@
+# The Jobly Railway template
+
+The **Deploy on Railway** button opens a Railway template that creates a complete Jobly
+instance in the business's own Railway account. This page is for whoever maintains that template:
+what it contains, how to rebuild it, and the button. For running an instance, see
+[docs/deploy.md](../docs/deploy.md).
+
+The same instance is described three ways, which should stay in step:
+
+- [`docker-compose.yml`](../docker-compose.yml): with Docker (`npm run instance`). This is the
+  tested reference, and CI starts it on every push.
+- [`.railway/railway.ts`](../.railway/railway.ts): Railway Infrastructure as Code, for standing up a
+  real instance from this repository.
+- The template itself, in the Railway dashboard (below).
+
+## What the template contains
+
+Five services, which fits Railway's free trial (5 services per project) as well as the paid
+plans. Only `jobly` gets a public domain. Secrets use Railway's template functions, so
+every deploy generates its own and the person deploying fills in nothing.
+
+**Secrets the owner must keep.** The two generated secrets exist only in that project's variables,
+so tell every owner to save them somewhere outside Railway the day they deploy: `JWT_SECRET` (and
+`ENCRYPTION_KEY`, if they set one) from the **jobly** service's **Variables**, and
+`POSTGRES_PASSWORD` from the **db** service's. Without `JWT_SECRET`, a restored Jobly can't read
+its connected apps, the owner's key file stops working, and links already sent to clients stop
+opening (the key that encrypts app tokens and signs links is derived from it,
+`apps/api/src/lib/crypto.ts`); without `POSTGRES_PASSWORD`, the services can't sign in to a database
+volume the owner kept or restored. Jobly's own nightly database backups don't hold either one
+([docs/deploy.md](../docs/deploy.md#database-backups)), and **Settings → Your data** says the same
+next to them without showing any value.
+
+### jobly
+
+- **Source:** Docker image `ghcr.io/aymenoppa/jobly:latest`, which always points at the newest
+  release (built from the root `Dockerfile`; see [Updates](#updates)). **Auto updates:** on, as
+  soon as ready.
+- **Networking:** public HTTP on port **8080**; a generated `*.up.railway.app` domain.
+- **Deploy:** healthcheck path `/api/health`, healthcheck timeout **600** seconds (a brand-new
+  instance waits for its database and services, then sets up the schema).
+- **Variables:**
+
+| Name | Value |
+| --- | --- |
+| `PORT` | `8080` |
+| `APP_URL` | `https://${{RAILWAY_PUBLIC_DOMAIN}}` |
+| `JWT_SECRET` | `${{secret(64, "abcdef0123456789")}}` |
+| `SUPABASE_DB_URL` | `postgres://postgres:${{db.POSTGRES_PASSWORD}}@${{db.RAILWAY_PRIVATE_DOMAIN}}:5432/postgres` |
+| `SUPABASE_AUTH_URL` | `http://${{auth.RAILWAY_PRIVATE_DOMAIN}}:9999` |
+| `SUPABASE_REST_URL` | `http://${{rest.RAILWAY_PRIVATE_DOMAIN}}:3000` |
+| `SUPABASE_STORAGE_URL` | `http://${{storage.RAILWAY_PRIVATE_DOMAIN}}:5000` |
+| `RAILWAY_HEALTHCHECK_TIMEOUT_SEC` | `600` |
+| `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` | `30` |
+
+- **Stopping:** when an update takes over, Railway tells the old version to stop and, without
+  `RAILWAY_DEPLOYMENT_DRAINING_SECONDS`, kills it that instant, cutting off requests and background
+  tasks (a charge, a send) half-way. With it the old version gets 30 seconds, and stops as soon as
+  what was under way has finished (`shutdown` in `apps/api/src/server.ts` waits up to 25).
+  `docker-compose.yml` allows the same with `stop_grace_period`. An instance made before this
+  variable was in the template doesn't have it, and a template change never reaches an existing
+  instance: its owner adds it under the `jobly` service's **Variables**.
+- **Visitors' addresses:** nothing to set. On Railway, rate limits and quote approvals go by the
+  `X-Real-IP` header Railway's edge sets on every request (`apps/api/src/lib/visitor.ts`), and the
+  gateway passes the same address on to `auth` and `storage`. `JOBLY_VISITOR_IP` is for other
+  proxies in front ([docs/deploy.md](../docs/deploy.md#visitors-addresses)); leave it out of the
+  template.
+
+### db
+
+- **Source:** Docker image `ghcr.io/aymenoppa/jobly-db:pg17`, which always points at the newest
+  database image for Postgres 17 (built from `deploy/postgres/Dockerfile`: Supabase's Postgres
+  image plus the role setup). **Auto updates:** on, overnight.
+- **Volume:** mounted at `/var/lib/postgresql/data`.
+- **Variables:** `POSTGRES_PASSWORD` = `${{secret(32, "abcdef0123456789")}}`, `POSTGRES_HOST` =
+  `/var/run/postgresql`, `POSTGRES_PORT` = `5432`, `PGPORT` = `5432`, `POSTGRES_DB` = `postgres`.
+
+### auth, rest, storage
+
+Docker images, with the variables in `.railway/railway.ts` (every `${{...}}` there is a Railway
+reference and works as written):
+
+| Service | Image | Also |
+| --- | --- | --- |
+| `auth` | `public.ecr.aws/supabase/gotrue:v2.197.0` | |
+| `rest` | `public.ecr.aws/supabase/postgrest:v16.4` | |
+| `storage` | `public.ecr.aws/supabase/storage-api:v1.82.1` | Volume mounted at `/var/lib/storage`; `PORT` = `5000` (Railway otherwise sets `PORT` and Storage listens there); `FILE_SIZE_LIMIT` = `209715200` (200 MB per file, for plan sets; instances made before October 2026 have `52428800`); `TUS_URL_EXPIRY_MS` = `86400000` (a resumable upload can carry on for a day rather than Storage's default hour; instances made before October 2026 don't have it, and uploads work there too) |
+
+Keep these versions in step with `docker-compose.yml`, and test a version change there first.
+
+### Files in a bucket (opt-in)
+
+The template keeps photos and files on `storage`'s volume (`STORAGE_BACKEND` = `file`). Don't put
+a Railway bucket in it: Railway's Limited Trial has no buckets, and Railway backs up volumes (on
+Pro) but never buckets, so that's each owner's choice. An owner moves an instance's files into a
+bucket from **Settings → Hosting → Files storage** ([docs/deploy.md](../docs/deploy.md#moving-files-to-a-bucket)):
+Jobly makes a bucket named `files`, copies every file to the key Storage's S3 backend reads
+(`jobly/<bucket>/<name>/<version>`), then sets these on `storage` and redeploys it, keeping the
+volume, `FILE_STORAGE_BACKEND_PATH` and `GLOBAL_S3_BUCKET` for moving back:
+
+| Name | Value |
+| --- | --- |
+| `STORAGE_BACKEND` | `s3` |
+| `STORAGE_S3_BUCKET` | `${{files.BUCKET}}` (the bucket's own S3 name) |
+| `STORAGE_S3_ENDPOINT` | `${{files.ENDPOINT}}` |
+| `STORAGE_S3_REGION` | `${{files.REGION}}` (leave `REGION` at `local`) |
+| `STORAGE_S3_FORCE_PATH_STYLE` | `false` (`true` only for a bucket whose credentials say path style) |
+| `AWS_ACCESS_KEY_ID` | `${{files.ACCESS_KEY_ID}}` |
+| `AWS_SECRET_ACCESS_KEY` | `${{files.SECRET_ACCESS_KEY}}` |
+| `TUS_ALLOW_S3_TAGS` | `false` |
+| `STORAGE_S3_REQUEST_CHECKSUM_CALCULATION`, `STORAGE_S3_RESPONSE_CHECKSUM_VALIDATION` | `WHEN_REQUIRED` |
+
+Moving back sets `STORAGE_BACKEND` to `file` and `STORAGE_S3_BUCKET` to `jobly`: the file backend
+keeps files under a folder named after `STORAGE_S3_BUCKET` (or `GLOBAL_S3_BUCKET` when that's unset),
+so left on the bucket's name it would look for every file in the wrong place. `.railway/railway.ts`
+has the same setup, commented out, for standing up an instance that starts on a bucket.
+
+`docker-compose.yml` takes the same images from Docker Hub (`supabase/gotrue`,
+`postgrest/postgrest`, `supabase/storage-api`; the digests match), because anonymous pulls from
+`public.ecr.aws` fail on GitHub's runners with "Data limit exceeded". The template stays on
+`public.ecr.aws` for now: Railway pulls from its own network and hasn't hit that limit. If it ever
+does, switch these three services to the Docker Hub names in the template and `.railway/railway.ts`.
+Make sure their auto updates are off when you do: Railway can watch Docker Hub, and would otherwise
+move them to versions nobody tested here.
+
+## The live template
+
+**https://railway.com/deploy/jobly** (template code `jobly`, in the
+`aymenoppa's Projects` workspace on Railway). Edit it under **Workspace → Templates → Jobly**. The
+template names the moving tags, so a release doesn't need a template change. The exception is a new
+Postgres major version: point `db` at its new tag (`pg18`) so new deploys start on it.
+
+## Rebuilding the template
+
+**Generate Template from Project** refused the reference project ("Service jobly does not have a
+source that can be used to generate a template"), so the template was built by hand in the
+template editor. To do it again:
+
+1. Railway → **Templates → New**.
+2. **Add New → Docker Image** for each service (images above), renamed to exactly `jobly`, `db`,
+   `auth`, `rest` and `storage`; the variables refer to services by name. Attach a volume to `db`
+   at `/var/lib/postgresql/data` and to `storage` at `/var/lib/storage` (right-click the service →
+   **Attach Volume**).
+3. On `jobly` and `db`: **Settings → Source → Configure auto updates**, as listed above. (A
+   tag that isn't a version number has no patch or minor choice: Railway redeploys whenever a new
+   image is pushed to it.)
+4. Paste each service's variables into its **Variables → Raw Editor**: the tables above, and
+   `.railway/railway.ts` for auth, rest and storage, with `${{secret(...)}}` for `JWT_SECRET` and
+   `POSTGRES_PASSWORD` so every deploy gets its own.
+5. On `jobly`: **Settings → Networking → HTTP Proxy** on port `8080`, healthcheck path
+   `/api/health`, and the variable `RAILWAY_HEALTHCHECK_TIMEOUT_SEC` = `600` (the editor has no
+   timeout field).
+6. **Apply** the changes, set the name, icon and description under the template's settings, and
+   copy the URL from **Share**.
+7. Deploy it once into a fresh project and check that `/api/setup` answers `"ready":true`.
+
+A Railway trial account runs one instance at a time: its resource cap counts every project, so
+delete an earlier test project before deploying the template again.
+
+## The button
+
+```html
+<a href="https://railway.com/deploy/jobly"><img src="https://railway.com/button.svg" alt="Deploy on Railway"></a>
+```
+
+## Updates
+
+Instances update themselves to every release, whatever its number. `jobly` and `db` run images
+that [`.github/workflows/release.yml`](../.github/workflows/release.yml) publishes to GitHub's
+container registry when a version tag is pushed. Each image gets its version tag (`0.2.0`) and, when
+it's the highest version so far, a moving tag the template points at: `jobly:latest`, and
+`jobly-db:pg17` for the database. The template turns on Railway's
+[image auto updates](https://docs.railway.com/deployments/image-auto-updates) for both, and for a
+tag that isn't a version number Railway redeploys whenever a new image is pushed to it. It can take
+several hours to notice (it caches what it finds in the registry), then it redeploys the service
+and notifies the workspace's admins. The business does nothing, and nothing is paid for: the images
+are public, and GitHub Actions and the registry are free for public repositories.
+
+- **jobly** updates as soon as Railway sees a release. There's no downtime: the new version
+  applies migrations as it starts and only takes traffic once `/api/health` answers, so a failed
+  update leaves the previous version serving.
+- **db** gets a new image only when `deploy/postgres` changed since the previous release, so most
+  releases don't touch it. It updates overnight (02:00–06:00 UTC) and is down for about a minute
+  while Postgres restarts. Its tag names the Postgres major version because that's the one change
+  an instance can't take unattended: Postgres 18 can't open Postgres 17's data until it's upgraded.
+  A release that moves to a new major publishes `pg18`, instances stay on `pg17` until their owner
+  upgrades, and the release notes say how.
+- **auth, rest and storage** stay on the versions the template pins: Railway can't watch their
+  registry (`public.ecr.aws`). Changing one of them reaches new instances only.
+- **Opting out:** an owner can turn updates off, or change when they install, under the service's
+  **Settings → Source → Configure auto updates**. To stay on one version, they set the image to its
+  version tag there (`ghcr.io/aymenoppa/jobly:0.2.0`), which then takes only that version's patch
+  updates, or none with auto updates off.
+- **Going back:** a version older than the one that last updated the database still starts (an
+  owner setting the image back, a rollback in Railway). One release back is meant to work, and
+  it's all an owner can do about a bad release until its fix is out; refusing would only leave the
+  instance down. It doesn't go unnoticed, though: the log says the database holds migrations this
+  version doesn't know, `/api/health` adds `"problem":"newer_database"`, and error monitoring is
+  told (`scripts/migrate.mjs` has the reasoning).
+
+`https://<instance>/api/health` shows the version an instance runs, for example
+`{"ok":true,"version":"0.1.1"}`; Railway itself only shows the tag, `latest`. The service's
+**Deployments** list shows each update with the reason "autoupdate". In the first test (on version
+tags, before the moving tags), an instance moved from 0.1.0 to 0.1.1 by itself 4 hours 16 minutes
+after the release was published.
+
+### Releasing
+
+On a commit of `main`:
+
+```bash
+git tag v0.1.2
+git push origin v0.1.2
+```
+
+The workflow first checks that the tagged commit is on `main`, then runs everything CI runs
+([`ci.yml`](../.github/workflows/ci.yml)) for that commit. Only when all of it passes does it publish
+`ghcr.io/aymenoppa/jobly:0.1.2` (and `jobly-db:0.1.2` when `deploy/postgres` changed) and move the
+moving tags to it, about twenty minutes after the push. Instances pick it up over the next several
+hours. If a check fails, nothing is published and instances stay where they are: fix `main` and
+release the next number, or, when the failure had nothing to do with the code (a download that timed
+out), choose **Re-run failed jobs** on the workflow's run. Write release notes on GitHub for anything
+an owner should know.
+
+The number is up to you (`0.1.2`, `0.2.0`, `1.0.0` all install the same way), but every release
+reaches every instance unattended, so it has to work without anyone doing anything:
+
+- **Migrations:** the previous version keeps serving while the new one migrates, so a migration has
+  to leave the database usable by the previous version (add first, remove in a later release). It
+  also has to work on the rows instances already hold, not only on an empty database. CI checks that
+  (`npm run test:upgrade`): it builds the database as the previous release left it, fills it with
+  the rows that release's own database tests make, and applies every migration added since, the way
+  an instance does. A migration that has been released is never edited, which the same check
+  enforces: instances have applied it and won't apply it again. The app is in use while a
+  migration runs, so each one waits ten seconds at most for a table and is tried again a few times
+  if the database was busy (`scripts/migrate.mjs`); one that needs a busy table for long won't get
+  through.
+- **Settings:** a new variable needs a default. If the new version can't start without it, every
+  instance stays on the previous version until its owner adds it.
+- **Fixing a bad release:** release a fix as a new version. Moving `latest` back to an older image
+  would run old code against a database the newer one has already migrated.
+
+A tag on a commit that isn't on `main` is refused, so a fix can't be released from an older version's
+code on a branch (`v0.1.9` after `v0.2.0`): owners who stayed on an older version get fixes by moving
+to the newest one. A lower number tagged on an older commit of `main` gets its version tag only: the
+moving tags stay on the highest version.
+
+### Switching to the moving tags
+
+Done on 2026-10-18: release `v0.1.3` created `jobly:latest` and `jobly-db:pg17`, the template
+was switched to them, and so was the test instance (`pure-prosperity`).
+
+Instances deployed before then run version tags with patch updates (`0.1.x`), and keep that setting
+until their owner changes the image in each service's **Settings → Source** to the same tags.
+
+Still to check: that an instance takes the next release by itself (`/api/health` shows the new
+version). People have reported Railway missing a moved tag on GitHub's registry, so don't rely on it
+before then.
+
+### Why images
+
+The template used to build `jobly` and `db` from this repository. A deploy like that is pinned to
+the commit it started from: a business's Railway account can't deploy on pushes to someone else's
+repository, and Railway's template updates only show **Update available** after someone presses
+**Check for updates** in a service's settings, then ask for a confirmation per service. Every commit
+counted as an update, a docs change included, and the database rebuilt and restarted with each one.
+
+An instance deployed that way moves over in each service's **Settings → Source**: disconnect the
+repository, connect the image `ghcr.io/aymenoppa/jobly:latest` (or `jobly-db:pg17` on `db`),
+and configure auto updates as above.

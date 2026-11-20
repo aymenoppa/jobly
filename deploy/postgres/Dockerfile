@@ -1,0 +1,18 @@
+# The database service for one Jobly instance (Railway template or docker compose): Supabase's
+# Postgres image, plus the setup Supabase's own docker setup mounts in (role passwords and JWT
+# expiry). See deploy/README.md.
+#
+# From Docker Hub: anonymous pulls from public.ecr.aws fail on GitHub's runners ("Data limit
+# exceeded"), and the release workflow builds this image there. It's the same image on both.
+FROM supabase/postgres:17.11.0.004
+
+# Railway volumes have a lost+found folder at their root, which initdb refuses, so the data lives
+# one level down. Mount the volume at /var/lib/postgresql/data.
+ENV PGDATA=/var/lib/postgresql/data/pgdata \
+    JWT_EXP=3600
+
+COPY init/roles.sql /docker-entrypoint-initdb.d/init-scripts/99-roles.sql
+COPY init/jwt.sql /docker-entrypoint-initdb.d/init-scripts/99-jwt.sql
+
+# Supabase's postgresql.conf names the data directory itself; point it at the subfolder too.
+CMD ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf", "-c", "data_directory=/var/lib/postgresql/data/pgdata", "-c", "log_min_messages=fatal"]

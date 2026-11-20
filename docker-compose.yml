@@ -1,0 +1,135 @@
+# One Jobly instance on your own computer: the same services the Railway template creates for
+# each business (see deploy/README.md). Start it with
+#
+#   npm run instance          generates .env.instance (secrets) once, then docker compose up
+#
+# and open http://localhost:8080. Only the jobly service is published, on this computer alone (a
+# web server here puts it online); it forwards to the others, the way it does on Railway. Data lives
+# in the db-data and storage-data volumes.
+
+name: jobly-instance
+
+x-secrets: &db-password ${POSTGRES_PASSWORD:?run npm run instance, or set POSTGRES_PASSWORD in .env.instance}
+
+services:
+  db:
+    build: deploy/postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: *db-password
+      POSTGRES_HOST: /var/run/postgresql
+      POSTGRES_PORT: 5432
+      PGPORT: 5432
+      POSTGRES_DB: postgres
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # auth, rest and storage come from Docker Hub: anonymous pulls from public.ecr.aws, where the
+  # Railway template takes them, fail on GitHub's runners ("Data limit exceeded"). Same images, same
+  # digests.
+  auth:
+    image: supabase/gotrue:v2.197.0
+    restart: unless-stopped
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: ${APP_URL:-http://localhost:8080}/auth/v1
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@db:5432/postgres
+      GOTRUE_SITE_URL: ${APP_URL:-http://localhost:8080}
+      GOTRUE_URI_ALLOW_LIST: ${APP_URL:-http://localhost:8080}/**
+      # One business per instance: the owner's account is made on first run, everyone else is invited.
+      GOTRUE_DISABLE_SIGNUP: "true"
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+      GOTRUE_MAILER_OTP_EXP: 86400
+      # The code behind a link's token: as long as Auth allows. Nobody types it (Jobly's own
+      # sign-in codes are its own), and the gateway only redeems tokens the server signed.
+      GOTRUE_MAILER_OTP_LENGTH: 10
+      GOTRUE_EXTERNAL_PHONE_ENABLED: "false"
+      GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED: "false"
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      # Claude and ChatGPT connect through this (the Apps page in Jobly).
+      GOTRUE_OAUTH_SERVER_ENABLED: "true"
+      GOTRUE_OAUTH_SERVER_AUTHORIZATION_PATH: /oauth/consent
+      GOTRUE_OAUTH_SERVER_ALLOW_DYNAMIC_REGISTRATION: "true"
+
+  rest:
+    image: postgrest/postgrest:v16.4
+    restart: unless-stopped
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@db:5432/postgres
+      PGRST_DB_SCHEMAS: public,graphql_public
+      PGRST_DB_EXTRA_SEARCH_PATH: public,extensions
+      PGRST_DB_MAX_ROWS: 1000
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_EXP: 3600
+      PGRST_SERVER_HOST: "*"
+
+  storage:
+    image: supabase/storage-api:v1.82.1
+    restart: unless-stopped
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      PORT: 5000
+      # Signs its own keys with the shared secret.
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@db:5432/postgres
+      POSTGREST_URL: http://rest:3000
+      STORAGE_BACKEND: file
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      # 200 MB per file: plan sets run big (apps/web/src/features/plans/plans.ts).
+      FILE_SIZE_LIMIT: 209715200
+      # A resumable upload (apps/web/src/lib/resumable.ts) can carry on for a day rather than
+      # Storage's default hour, for crews on patchy signal.
+      TUS_URL_EXPIRY_MS: 86400000
+      TENANT_ID: jobly
+      REGION: local
+      GLOBAL_S3_BUCKET: jobly
+      REQUEST_ALLOW_X_FORWARDED_PATH: "true"
+      ENABLE_IMAGE_TRANSFORMATION: "false"
+      # Jobly doesn't use Storage's S3 address; the gateway turns it away too.
+      S3_PROTOCOL_ENABLED: "false"
+      SERVER_HOST: 0.0.0.0
+    volumes:
+      - storage-data:/var/lib/storage
+
+  jobly:
+    build: .
+    restart: unless-stopped
+    depends_on: { db: { condition: service_healthy } }
+    # Asked to stop, Jobly finishes the requests and background tasks under way first
+    # (apps/api/src/server.ts). Docker gives it 30 seconds for that, as Railway does
+    # (RAILWAY_DEPLOYMENT_DRAINING_SECONDS in .railway/railway.ts), rather than its usual 10.
+    stop_grace_period: 30s
+    # Only on this computer (JOBLY_BIND), for the web server in front to forward to: Jobly
+    # believes X-Forwarded-For from Docker's network, and on every address Docker would hand some
+    # outside connections over from there too (docs/deploy.md, Visitors' addresses).
+    ports:
+      - "${JOBLY_BIND:-127.0.0.1}:${JOBLY_PORT:-8080}:8080"
+    # Optional features (email, texting, payments, maps...): add them to .env.instance.
+    env_file:
+      - path: .env.instance
+        required: false
+    environment:
+      JWT_SECRET: ${JWT_SECRET}
+      SUPABASE_DB_URL: postgres://postgres:${POSTGRES_PASSWORD}@db:5432/postgres
+      APP_URL: ${APP_URL:-http://localhost:8080}
+      JOBLY_PLATFORM: compose
+
+volumes:
+  db-data:
+  storage-data:
