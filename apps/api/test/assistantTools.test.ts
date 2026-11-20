@@ -1,0 +1,727 @@
+/**
+ * The tools that run the business (assistant-tools/): importing clients and a schedule with a
+ * preview first and no duplicates on a second run, money refused to "Full access, no money",
+ * reports for the roles that see them, argument errors that name the field, invites that never
+ * hand their link to the assistant, a crew's route organized (or only shown) from a chat, and quotes
+ * that offer options read and approved for the option the client chose, keeping the contract they
+ * were sent.
+ */
+import { assistantRefusal } from "@jobly/core";
+import { templateSettings } from "@jobly/core/documents";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Env } from "../src/env";
+
+const invites = vi.hoisted(() => ({ calls: [] as unknown[] }));
+vi.mock("../src/services/team", async (original) => ({
+  ...(await original<typeof import("../src/services/team")>()),
+  invitePerson: async (_scope: unknown, body: unknown) => {
+    invites.calls.push(body);
+    return { user_id: "user-9", invited: true, emailed: true, reason: null, link: "https://ops.example.com/auth/confirm?token=SECRET" };
+  },
+}));
+const { app } = await import("../src/app");
+const { ADMIN_FROM_TEAM_PAGE } = await import("../src/services/team");
+
+const env: Env = { SUPABASE_URL: "http://127.0.0.1:8080", SUPABASE_PUBLISHABLE_KEY: "sb_publishable_test", SUPABASE_SECRET_KEY: "sb_secret_test", APP_URL: "https://ops.example.com" };
+const part = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
+const token = (client: string) => `${part({ alg: "HS256", typ: "JWT" })}.${part({ sub: "user-1", role: "authenticated", exp: Math.floor(Date.now() / 1000) + 600, client_id: client })}.c2ln`;
+const CONNECTIONS: Record<string, { level: string; areas: string[] }> = {
+  full: { level: "full", areas: [] },
+  nomoney: { level: "full_no_money", areas: [] },
+  jobsonly: { level: "areas", areas: ["jobs", "clients"] },
+};
+
+type Row = Record<string, any>;
+/** Supabase in memory: tables of rows, inserts that keep what they're given, the person's role, and what database functions answer. */
+function supabase(role = "owner", answers: Record<string, unknown> = {}) {
+  const db: Record<string, Row[]> = { clients: [], properties: [], jobs: [], visits: [], assistant_calls: [] };
+  const sent: Array<{ method: string; table: string; body: any; query?: URLSearchParams }> = [];
+  const memberships: URL[] = [];
+  let id = 0;
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input instanceof Request ? input.url : input));
+    const method = init?.method ?? "GET";
+    const body = typeof init?.body === "string" ? JSON.parse(init.body) : null;
+    const table = url.pathname.replace("/rest/v1/", "");
+    if (url.pathname === "/auth/v1/user") return Response.json({ id: "user-1", aud: "authenticated", role: "authenticated" });
+    if (table === "rpc/rate_limit_hit") return Response.json(true);
+    if (table in answers) return Response.json(answers[table]);
+    if (table === "assistant_connections") {
+      const client = url.searchParams.get("client_id")?.replace(/^eq\./, "") ?? "";
+      return Response.json(CONNECTIONS[client] ? [CONNECTIONS[client]] : []);
+    }
+    if (table === "memberships") memberships.push(url);
+    if (table === "memberships") return Response.json([{ company_id: "company-1", role, role_id: null, company: { timezone: "America/New_York", settings: {} } }]);
+    if (!url.pathname.startsWith("/rest/v1/")) return Response.json([]);
+    sent.push({ method, table, body, query: url.searchParams });
+    const rows = (db[table] ??= []);
+    if (method === "POST") {
+      const made = (Array.isArray(body) ? body : [body]).map((r: Row) => ({ id: r.id ?? `${table}-${++id}`, ...r }));
+      rows.push(...made);
+      const single = (init?.headers as Record<string, string> | undefined)?.Accept?.includes("vnd.pgrst.object");
+      return Response.json(single ? made[0] : made, { status: 201 });
+    }
+    if (method === "PATCH") {
+      const ids = url.searchParams.get("id")?.replace(/^in\.\(|\)$|^eq\./g, "").split(",") ?? [];
+      const hit = rows.filter((r) => ids.includes(r.id));
+      for (const r of hit) Object.assign(r, body);
+      return Response.json(hit);
+    }
+    return Response.json(rows);
+  });
+  return { db, sent, memberships };
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  invites.calls = [];
+});
+
+const call = async (client: string, name: string, args: object) => {
+  const res = await app.request("/mcp", { method: "POST", headers: { Authorization: `Bearer ${token(client)}`, "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }) }, env);
+  const result = (await res.json()).result;
+  return result.isError ? { error: result.content[0].text as string } : result.structuredContent.result;
+};
+
+const SPREADSHEET = [
+  { source_id: "J-1", name: "Ana Diaz", email: "ana@example.com", status: "active", properties: [{ line1: "12 Oak St", city: "Oakridge" }] },
+  { source_id: "J-2", name: "Bo Kent", status: "inactive", properties: [{ line1: "9 Main Street", city: "Oakridge" }, { line1: "9 Main St", city: "Oakridge" }] },
+];
+
+describe("importing clients", () => {
+  it("previews without changing anything, then commits, and a second run adds nothing", async () => {
+    const { db, sent } = supabase();
+    const preview = await call("full", "import_clients", { mode: "preview", clients: SPREADSHEET });
+    expect(preview.totals).toEqual({ clients: 2, create: 2, match: 0, status_changes: 0, properties: 2, kept_properties: 0 });
+    expect(sent.filter((s) => s.method !== "GET" && s.table !== "assistant_calls")).toEqual([]);
+
+    const commit = await call("full", "import_clients", { mode: "commit", clients: SPREADSHEET });
+    expect(commit.clients.map((c: Row) => [c.name, c.status, c.property_ids.length])).toEqual([["Ana Diaz", "active", 1], ["Bo Kent", "archived", 1]]);
+    expect(db.clients.map((c) => [c.display_name, c.status, c.custom_fields.source_id])).toEqual([["Ana Diaz", "active", "J-1"], ["Bo Kent", "archived", "J-2"]]);
+    expect(db.properties).toHaveLength(2);
+
+    const again = await call("full", "import_clients", { mode: "commit", clients: SPREADSHEET });
+    expect(again.totals).toMatchObject({ create: 0, match: 2, properties: 0, kept_properties: 2 });
+    expect(again.clients.map((c: Row) => c.action)).toEqual(["already here (by source_id)", "already here (by source_id)"]);
+    expect(db.clients).toHaveLength(2);
+    expect(db.properties).toHaveLength(2);
+  });
+
+  it("takes custom field values by key, checked against the business's fields, and fills only empty ones on a client already here", async () => {
+    const { db } = supabase();
+    db.custom_field_definitions = [
+      { key: "gate_code", label: "Gate code", type: "text", choices: [], archived_at: null },
+      { key: "dog", label: "Dog on site", type: "yes_no", choices: [], archived_at: null },
+    ];
+    const preview = await call("full", "import_clients", {
+      mode: "preview",
+      clients: [{ source_id: "J-1", name: "Ana Diaz", custom_fields: { gate_code: "4410", dog: "yes" } }, { name: "Bo Kent", custom_fields: { dog: "maybe" } }],
+    });
+    expect(preview.skipped).toEqual([{ row: 1, reason: "Dog on site is yes or no." }]);
+
+    await call("full", "import_clients", { mode: "commit", clients: [{ source_id: "J-1", name: "Ana Diaz", custom_fields: { gate_code: "4410" } }] });
+    expect(db.clients[0]!.custom_fields).toEqual({ gate_code: "4410", source_id: "J-1" });
+
+    // Again, with another gate code and her dog: the code she has stays, the dog is added.
+    await call("full", "import_clients", { mode: "commit", clients: [{ source_id: "J-1", name: "Ana Diaz", custom_fields: { gate_code: "9999", dog: true } }] });
+    expect(db.clients).toHaveLength(1);
+    expect(db.clients[0]!.custom_fields).toEqual({ gate_code: "4410", dog: true, source_id: "J-1" });
+  });
+});
+
+describe("importing a schedule", () => {
+  it("places items by address or name, says what it can't place, and needs the schedule to commit", async () => {
+    const { db } = supabase();
+    db.clients.push({ id: "c-ana", display_name: "Ana Diaz", company_name: null }, { id: "c-bo", display_name: "Bo Kent", company_name: null });
+    db.properties.push({ id: "p-ana", client_id: "c-ana", line1: "12 Oak St", city: "Oakridge" }, { id: "p-bo", client_id: "c-bo", line1: "9 Main St", city: "Oakridge" });
+    const items = [
+      { title: "Mowing", address: { line1: "12 Oak Street" }, first_date: "2026-04-07", start_time: "09:00", duration_min: 45, repeat: { every_weeks: 2 }, price: 45 },
+      { title: "Mowing", client_name: "bo kent", first_date: "2026-04-08", repeat: { rule: "FREQ=WEEKLY;INTERVAL=2;BYDAY=WE" } },
+      { title: "Mowing", client_name: "Cy Lane", first_date: "2026-04-09", repeat: { every_weeks: 2 } },
+      { title: "Sharpen blades", kind: "task", first_date: "2026-04-06" },
+    ];
+    const preview = await call("full", "import_schedule", { mode: "preview", items });
+    expect(preview.totals).toEqual({ items: 4, ready: 3, already_here: 0, problems: 1 });
+    expect(preview.items.map((i: Row) => [i.client_id, i.property_id, i.found_by, i.repeats ?? null])).toEqual([
+      ["c-ana", "p-ana", "address", "every 2 weeks on Tuesday"],
+      ["c-bo", "p-bo", "name", "every 2 weeks on Wednesday"],
+      [null, null, null, "every 2 weeks on Thursday"],
+      [null, null, null, null],
+    ]);
+    expect(preview.items[0].next_dates).toEqual(["2026-04-07", "2026-04-21", "2026-05-05"]);
+    expect(preview.items[2].problem).toMatch(/^No client found/);
+    expect((await call("jobsonly", "import_schedule", { mode: "commit", items })).error).toBe(
+      "This assistant can't change the schedule. To let it, choose what it can change in Jobly, under Settings → AI assistants.",
+    );
+    expect(db.jobs).toHaveLength(0);
+  });
+});
+
+describe("money", () => {
+  it("is out of reach for full access without money, and says how to allow it", async () => {
+    const { sent } = supabase();
+    for (const [name, args] of [
+      ["record_payment", { invoice_id: "6f4cc1b2-7e43-4c1d-9a8e-3c2f1d0b9a87", amount: 50, method: "check" }],
+      ["create_quote", { client_id: "6f4cc1b2-7e43-4c1d-9a8e-3c2f1d0b9a87", title: "Sealcoat" }],
+      ["mark_paid", { from: "2026-10-12", to: "2026-10-18", method: "check" }],
+      ["save_promo_code", { code: "SPRING10", kind: "percent", value: 10 }],
+    ] as const) {
+      expect((await call("nomoney", name, args)).error, name).toMatch(/^This assistant can't change money: quotes, invoices, payments, pay or promo codes\./);
+    }
+    expect(sent.filter((s) => ["payments", "quotes", "pay_periods", "promo_codes"].includes(s.table))).toEqual([]);
+  });
+
+  it("job profit counts sub and crew pay as labor, once", async () => {
+    const { db } = supabase("owner", { "rpc/job_pay_costs": [{ job_id: "j1", amount: 2700, payees: 1 }] });
+    db.jobs.push(
+      { id: "j1", number: 12, title: "New roof", status: "completed", financials: { contract_total: 12150 }, client: { display_name: "Ann" }, lines: [{ quantity: 27, unit_cost: 300, unit_labor_cost: 120 }] },
+      { id: "j2", number: 13, title: "Gutters", status: "completed", financials: { contract_total: 1440 }, client: { display_name: "Ann" }, lines: [{ quantity: 120, unit_cost: 5, unit_labor_cost: 2 }] },
+    );
+    const result = await call("full", "job_profit", {});
+    expect(result.jobs.find((j: Row) => j.id === "j1")).toMatchObject({ crew_pay: 2700, materials: 4860, line_labor_left_out: 3240, actual_labor: true, cost: 7560, profit: 4590 });
+    expect(result.jobs.find((j: Row) => j.id === "j2")).toMatchObject({ crew_pay: 0, materials: 600, line_labor_left_out: 0, actual_labor: false, cost: 600 });
+  });
+
+  it("figures are for the roles that see them", async () => {
+    supabase("estimator");
+    expect((await call("full", "money_report", {})).error).toBe("Your role in Jobly doesn't allow that. An owner or admin can change your role.");
+    expect((await call("full", "pay_summary", {})).error).toMatch(/^Pay is for the office/);
+  });
+});
+
+describe("tools", () => {
+  it("name every field that's wrong", async () => {
+    supabase();
+    const res = await call("full", "add_services", { items: [{ unit_price: "a lot" }, { name: "" }] });
+    expect(res.error).toMatch(/^Invalid arguments\. /);
+    expect(res.error).toContain("items.0.name");
+    expect(res.error).toContain("items.0.unit_price");
+    expect(res.error).toContain("items.1.name");
+  });
+
+  it("keep subs off the team: not listed, no Subcontractor level, not invited or made one", async () => {
+    const { memberships } = supabase();
+    const listed = await call("full", "list_team", {});
+    expect(listed.levels.map((l: { level: string }) => l.level)).not.toContain("subcontractor");
+    expect(listed.levels.map((l: { level: string }) => l.level)).toContain("field_crew");
+    // The people list asks the database for the team only.
+    expect(memberships.filter((u) => u.searchParams.get("select") === "user_id,role,role_id,active").map((u) => u.searchParams.get("role"))).toEqual(["neq.subcontractor"]);
+    const invite = await call("full", "invite_person", { email: "sub@example.com", role: "subcontractor" });
+    expect(invite.error).toMatch(/^Invalid arguments\. /);
+    expect(invites.calls).toEqual([]);
+    const change = await call("full", "change_role", { user_id: "00000000-0000-4000-8000-000000000009", role: "subcontractor" });
+    expect(change.error).toMatch(/^Invalid arguments\. /);
+  });
+
+  it("leave a promo code's discount on a job when its lines are replaced", async () => {
+    const { db, sent } = supabase();
+    const JOB = "6f4cc1b2-7e43-4c1d-9a8e-3c2f1d0b9a99";
+    db.jobs = [{ id: JOB, company_id: "company-1", kind: "recurring", starts_on: "2026-06-01", recurrence_rule: "FREQ=WEEKLY;BYDAY=MO" }];
+    expect(await call("full", "update_job", { job_id: JOB, lines: [{ name: "Mowing", unit_price: 45 }] })).toEqual({ saved: true });
+    // Taken off and put back as a plain line, it would come off every visit again (20261031000600_promo_once_per_job.sql).
+    const removed = sent.find((s) => s.method === "DELETE" && s.table === "job_line_items")!;
+    expect(removed.query!.get("job_id")).toBe(`eq.${JOB}`);
+    expect(removed.query!.get("discount_key")).toBe("is.null");
+    const added = sent.find((s) => s.method === "POST" && s.table === "job_line_items")!;
+    expect(added.body).toEqual([expect.objectContaining({ name: "Mowing", unit_price: 45 })]);
+    expect(added.body[0]).not.toHaveProperty("discount_billing");
+  });
+
+  it("list jobs with the state their visits give them, and by it", async () => {
+    const { sent } = supabase();
+    await call("full", "list_jobs", { status: "late" });
+    await call("full", "list_jobs", { status: "completed" });
+    await call("full", "list_jobs", {});
+    const [late, completed, active] = sent.filter((s) => s.table === "jobs").map((s) => s.query!);
+    expect(late.get("select")).toContain("job_state");
+    expect(late.get("job_state")).toBe("eq.late");
+    // job_state is the status for a job that isn't active (20261103000400_job_states.sql).
+    expect(completed.get("job_state")).toBe("eq.completed");
+    expect([active.get("status"), active.get("job_state")]).toEqual(["eq.active", null]);
+  });
+
+  it("ask a recurring job's two billing questions, and say how each job is billed", async () => {
+    const { db, sent } = supabase();
+    const JOB = "6f4cc1b2-7e43-4c1d-9a8e-3c2f1d0b9a98";
+    db.jobs = [{ id: JOB, company_id: "company-1", kind: "recurring", starts_on: "2026-06-01", recurrence_rule: "FREQ=WEEKLY;BYDAY=MO", billing_mode: "per_visit", pricing: "per_visit", invoice_schedule: "after_visit", invoice_day: null }];
+    expect(await call("full", "update_job", { job_id: JOB, pricing: "fixed", invoice_schedule: "monthly", invoice_day: 15 })).toEqual({ saved: true });
+    // billing_mode is the database's to keep in step (20261104000800_recurring_billing.sql).
+    expect(sent.find((s) => s.method === "PATCH" && s.table === "jobs")!.body).toEqual({ pricing: "fixed", invoice_schedule: "monthly", invoice_day: 15 });
+    db.jobs[0]!.billing_mode = "fixed_schedule";
+    const listed = await call("full", "list_jobs", {});
+    expect(listed.jobs[0].billing).toBe("Fixed price, monthly on the 15th");
+    expect(sent.filter((s) => s.table === "jobs" && s.method === "GET").at(-1)!.query!.get("select")).toContain("pricing,invoice_schedule,invoice_day");
+    expect((await call("full", "update_job", { job_id: JOB, invoice_day: 31 })).error).toMatch(/^Invalid arguments\. /);
+  });
+
+  it("pause and resume a recurring job, and repeat it in the new ways", async () => {
+    const { db, sent } = supabase();
+    const JOB = "6f4cc1b2-7e43-4c1d-9a8e-3c2f1d0b9a97";
+    const ONE_OFF = "6f4cc1b2-7e43-4c1d-9a8e-3c2f1d0b9a96";
+    db.jobs = [{ id: JOB, company_id: "company-1", kind: "recurring", starts_on: "2026-06-01", recurrence_rule: "FREQ=WEEKLY;BYDAY=MO" }];
+    expect(await call("full", "update_job", { job_id: JOB, paused: true, resume_on: "2026-12-01" })).toMatchObject({ saved: true });
+    const paused = sent.filter((s) => s.method === "PATCH" && s.table === "jobs").at(-1)!.body;
+    expect(paused).toEqual({ paused_at: expect.any(String), resume_on: "2026-12-01" });
+    expect(await call("full", "update_job", { job_id: JOB, paused: false })).toMatchObject({ saved: true });
+    expect(sent.filter((s) => s.method === "PATCH" && s.table === "jobs").at(-1)!.body).toEqual({ paused_at: null });
+    await call("full", "update_job", { job_id: JOB, repeat: { every_months: 1, on_weekday: { week: "last", day: "FR" }, times: 6 } });
+    expect(sent.filter((s) => s.method === "PATCH" && s.table === "jobs").at(-1)!.body).toMatchObject({ recurrence_rule: "FREQ=MONTHLY;INTERVAL=1;BYDAY=-1FR;COUNT=6" });
+    await call("full", "update_job", { job_id: JOB, repeat: { every_days: 10 } });
+    expect(sent.filter((s) => s.method === "PATCH" && s.table === "jobs").at(-1)!.body).toMatchObject({ recurrence_rule: "FREQ=DAILY;INTERVAL=10" });
+
+    db.jobs = [{ id: ONE_OFF, company_id: "company-1", kind: "one_off", starts_on: null, recurrence_rule: null }];
+    expect((await call("full", "update_job", { job_id: ONE_OFF, paused: true })).error).toContain("Only a recurring job can be paused");
+  });
+
+  it("invite people without handing the assistant their link", async () => {
+    supabase();
+    const result = await call("full", "invite_person", { email: "new@example.com", role: "office" });
+    expect(result).toEqual({ user_id: "user-9", invited: true, emailed: true, reason: null });
+    expect(JSON.stringify(result)).not.toContain("SECRET");
+    expect(invites.calls).toEqual([{ email: "new@example.com", full_name: undefined, role: "office", role_id: undefined }]);
+  });
+
+  it("never give admin access: that asks for the person's password, in Jobly", async () => {
+    const admin = { company_roles: [{ base_role: "admin", permissions: ["team"] }] };
+    const { sent } = supabase("owner", admin);
+    const person = "00000000-0000-4000-8000-000000000009";
+    for (const args of [{ user_id: person, role: "admin" }, { user_id: person, role: "owner" }, { user_id: person, role_id: "00000000-0000-4000-8000-0000000000aa" }]) {
+      expect((await call("full", "change_role", args)).error, JSON.stringify(args)).toBe(ADMIN_FROM_TEAM_PAGE);
+    }
+    expect((await call("full", "save_role", { name: "Everything", base_role: "admin", permissions: ["team"] })).error).toBe(ADMIN_FROM_TEAM_PAGE);
+    expect(sent.filter((r) => r.method !== "GET" && r.table !== "assistant_calls")).toEqual([]);
+    // A role that's admin-level already can still be renamed.
+    expect(await call("full", "save_role", { role_id: "00000000-0000-4000-8000-0000000000aa", name: "Manager", base_role: "admin", permissions: ["team"] })).toEqual({ role_id: "00000000-0000-4000-8000-0000000000aa", saved: true });
+  });
+});
+
+describe("routes", () => {
+  const lawns = () =>
+    [0, 1, 2].map((i) => ({
+      id: `visit-${i}`,
+      title: `Mow ${i}`,
+      kind: "job",
+      status: "scheduled",
+      starts_at: null,
+      ends_at: null,
+      route_order: null,
+      time_fixed: false,
+      property: { id: `property-${i}`, line1: `${i} Oak St`, city: "Oakridge", lat: 37.13 + (3 - i) / 100, lng: -80.57 },
+      job: { number: i, visit_duration_min: 20, client: null },
+    }));
+  const company = { timezone: "America/New_York", settings: { depot: { lat: 37.13, lng: -80.57 }, working_hours: { start: "08:00", end: "17:00" } } };
+
+  it("shows a crew's organized day without saving it", async () => {
+    const { db, sent } = supabase();
+    db.companies = [company];
+    db.visits = lawns();
+    const result = await call("full", "organize_route", { date: "2099-06-03", crew_id: null, save: false });
+    expect(result.saved).toBe(false);
+    expect(result.stops.map((s: { visit_id: string }) => s.visit_id)).toEqual(["visit-2", "visit-1", "visit-0"]);
+    // 20-minute lawns, any length, one after another in local time.
+    expect(result.stops[0]).toMatchObject({ order: 1, start_time: "08:05", end_time: "08:25" });
+    expect(sent.filter((r) => r.method === "PATCH")).toEqual([]);
+  });
+
+  it("saves the route and remembers the day", async () => {
+    const { db, sent } = supabase();
+    db.companies = [company];
+    db.visits = lawns();
+    const result = await call("full", "organize_route", { date: "2099-06-03", crew_id: null });
+    expect(result).toMatchObject({ saved: true, changed: 3 });
+    expect(sent.filter((r) => r.method === "PATCH" && r.table === "visits").map((r) => r.body.route_order)).toEqual([1, 2, 3]);
+    expect(sent.find((r) => r.method === "POST" && r.table === "routes")?.body).toMatchObject({ route_date: "2099-06-03", by_hand: false, organized_by: "user-1" });
+  });
+
+  it("lists one person's visits: the ones they're on, whatever the crew", async () => {
+    const { db } = supabase();
+    const ANA = "00000000-0000-4000-8000-0000000000a1";
+    db.companies = [company];
+    db.visits = [
+      { id: "theirs", title: "Mow", status: "scheduled", scheduled_on: "2099-06-03", starts_at: null, ends_at: null, crew_id: "crew-1", assignees: [{ user_id: ANA }, { user_id: "user-2" }] },
+      { id: "crews", title: "Edge", status: "scheduled", scheduled_on: "2099-06-03", starts_at: null, ends_at: null, crew_id: "crew-1", assignees: [] },
+    ];
+    const result = await call("full", "get_schedule", { from: "2099-06-03", user_id: ANA });
+    expect(result.visits.map((v: { id: string }) => v.id)).toEqual(["theirs"]);
+    expect((await call("full", "get_schedule", { from: "2099-06-03" })).visits).toHaveLength(2);
+  });
+
+  it("books a visit of any length", async () => {
+    const { db, sent } = supabase();
+    db.companies = [company];
+    await call("full", "create_visit", { title: "Mow 4 Elm St", kind: "task", date: "2099-06-03", start_time: "09:03", duration_min: 50, time_fixed: true });
+    const visit = sent.find((r) => r.method === "POST" && r.table === "visits")!.body[0];
+    expect([visit.starts_at, visit.ends_at, visit.time_fixed]).toEqual(["2099-06-03T13:03:00.000Z", "2099-06-03T13:53:00.000Z", true]);
+  });
+
+  it("finds open time only on the days the business works, around its people's own calendars", async () => {
+    const ANA = "00000000-0000-4000-8000-0000000000a1";
+    const CREW = "00000000-0000-4000-8000-0000000000c1";
+    const { db } = supabase();
+    // Mondays and Wednesdays, 8 to 10. Ana's own calendar has her busy at 8 on Monday, June 1.
+    db.companies = [{ ...company, settings: { ...company.settings, working_hours: { start: "08:00", end: "10:00", days: [1, 3] } } }];
+    db.calendar_events = [
+      { id: "e1", title: "Dentist", all_day: false, starts_at: "2099-06-01T12:00:00Z", ends_at: "2099-06-01T13:00:00Z", starts_on: "2099-06-01", ends_on: "2099-06-01", busy: true, source: { id: "s1", name: "Ana's", color: null, crew_id: null, user_id: ANA, blocks_time: true } },
+    ];
+    const find = async (crew_id?: string) => (await call("full", "find_time", { date_from: "2099-06-01", days: 7, duration_min: 60, crew_id })).slots.map((s: { date: string; start_time: string }) => `${s.date} ${s.start_time}`);
+    // The whole team: anyone's busy time counts.
+    expect(await find()).toEqual(["2099-06-01 09:00", "2099-06-03 08:00"]);
+    // A crew Ana is on is busy when she is; one she isn't on isn't.
+    db.crews = [{ id: CREW, lead_user_id: "user-1", crew_members: [{ user_id: ANA }] }];
+    expect(await find(CREW)).toEqual(["2099-06-01 09:00", "2099-06-03 08:00"]);
+    db.crews = [{ id: CREW, lead_user_id: "user-1", crew_members: [] }];
+    expect(await find(CREW)).toEqual(["2099-06-01 08:00", "2099-06-03 08:00"]);
+  });
+});
+
+describe("quotes that offer options", () => {
+  const QUOTE = "6f4cc1b2-7e43-4c1d-9a8e-3c2f1d0b9a87";
+  const GOOD = "0b8f3c2e-1d4a-4e6b-9c7d-2a1b3c4d5e60";
+  const BEST = "0b8f3c2e-1d4a-4e6b-9c7d-2a1b3c4d5e61";
+  const PAYMENT = "0b8f3c2e-1d4a-4e6b-9c7d-2a1b3c4d5e70";
+  // The business's template prints a payment section, and the quote's options are its quote_options rows too.
+  const template = templateSettings({ terms: "Thanks, {Customer name}.", sections: [PAYMENT] });
+  const offering = (db: Record<string, Row[]>, extra: Row = {}) => {
+    db.companies = [{ id: "company-1", name: "Summit Roofing", phone: "555-0100", timezone: "America/New_York", settings: {} }];
+    db.document_templates = [{ id: "t-1", company_id: "company-1", is_default: true, settings: template }];
+    db.contract_sections = [{ id: PAYMENT, company_id: "company-1", title: "Payment", body: "<p>{Total} for {Option}, {Customer name}.</p>", place: "terms", initials: false, sort: 0 }];
+    db.quotes = [{
+      id: QUOTE, number: 1042, title: "New roof", status: "sent", subtotal: 17300, discount_amount: 0, tax_rate: 0, tax_amount: 0, total: 17300, deposit_amount: 0, option_id: GOOD, promo: null,
+      sent_at: "2026-10-22T15:00:00Z", created_at: "2026-10-21T13:00:00Z", template_id: null, section_ids: [], roof_package_id: null, approval: null,
+      client: { display_name: "Dana Whitfield", billing_address: {} }, property: null,
+      lines: [
+        { id: "l-best", option_id: BEST, name: "Standing-seam metal roof", quantity: 30, unit_price: 1285, taxable: true, optional: false, selected: false, option_group: null, sort: 2 },
+        { id: "l-shared", option_id: null, name: "Dumpster", quantity: 1, unit_price: 500, taxable: true, optional: false, selected: true, option_group: null, sort: 0 },
+        { id: "l-good", option_id: GOOD, name: "Architectural shingle roof", quantity: 30, unit_price: 560, taxable: true, optional: false, selected: true, option_group: null, sort: 1 },
+      ],
+      options: [
+        { id: BEST, name: "Standing-seam metal", tier: "Best", highlights: [], warranty: "", sort: 1 },
+        { id: GOOD, name: "Architectural shingle", tier: "Good", highlights: ["Color you pick"], warranty: "30 years.", sort: 0 },
+      ],
+      ...extra,
+    }];
+    db.quote_options = db.quotes[0]!.options;
+  };
+  const writes = (sent: Array<{ method: string; table: string; body: any }>) => sent.filter((s) => s.method !== "GET" && s.table !== "assistant_calls");
+
+  it("are read with their options, each option's total, and the option each line is on", async () => {
+    const { db } = supabase();
+    offering(db);
+    const quote = await call("full", "get_quote", { quote_id: QUOTE });
+    expect(quote.option_id).toBe(GOOD);
+    expect(quote.options).toEqual([
+      { id: GOOD, name: "Architectural shingle", tier: "Good", highlights: ["Color you pick"], warranty: "30 years.", shown: true, total: 17300 },
+      { id: BEST, name: "Standing-seam metal", tier: "Best", highlights: [], warranty: "", shown: false, total: 39050 },
+    ]);
+    expect(quote.lines.map((l: Row) => [l.id, l.option_id])).toEqual([["l-shared", null], ["l-good", GOOD], ["l-best", BEST]]);
+    expect(quote).not.toHaveProperty("promo");
+  });
+
+  it("keep their lines out of reach: those are edited in Jobly", async () => {
+    const { db, sent } = supabase();
+    offering(db);
+    const result = await call("full", "update_quote", { quote_id: QUOTE, title: "Roof", lines: [{ name: "Gutters", unit_price: 900 }] });
+    expect(result.error).toBe("This quote offers options; edit its lines in Jobly.");
+    expect(writes(sent)).toEqual([]);
+  });
+
+  it("are approved for the option the client chose, set first and on its own", async () => {
+    const { db, sent } = supabase();
+    offering(db);
+    expect((await call("full", "mark_quote", { quote_id: QUOTE, status: "approved" })).error).toBe(
+      "This quote offers options (Architectural shingle, Standing-seam metal). Say which one the client chose with option_id, from get_quote.",
+    );
+    expect((await call("full", "mark_quote", { quote_id: QUOTE, status: "approved", option_id: "0b8f3c2e-1d4a-4e6b-9c7d-2a1b3c4d5e62" })).error).toBe("That option isn't on this quote. get_quote lists its options.");
+    expect((await call("full", "convert_quote_to_job", { quote_id: QUOTE })).error).toBe("This quote offers options. Mark it approved with the option the client chose first (mark_quote with option_id).");
+    expect(writes(sent)).toEqual([]);
+
+    // The approval keeps the option as it was offered, so the signed copy shows it even once it's renamed.
+    const picture = { path: "00000000-0000-4000-8000-000000000001/packages/11111111-1111-4111-8111-111111111111.jpg", width: 1600, height: 1000 };
+    Object.assign(db.quotes![0]!.options.find((o: Row) => o.id === BEST), { picture: picture.path, picture_width: 1600, picture_height: 1000, style: "metal", highlights: ["Lasts 50 years"], warranty: "40 years on the panels." });
+    expect(await call("full", "mark_quote", { quote_id: QUOTE, status: "approved", option_id: BEST })).toEqual({ saved: true });
+    const patches = writes(sent).filter((s) => s.table === "quotes").map((s) => s.body);
+    // And the contract the client was sent, filled in for the metal roof at its price, as "Mark approved" keeps it.
+    const approval = {
+      name: "Assistant",
+      method: "manual",
+      template,
+      option: { id: BEST, name: "Standing-seam metal", tier: "Best", picture, style: "metal", highlights: ["Lasts 50 years"], warranty: "40 years on the panels." },
+      contract: {
+        terms: "Thanks, Dana Whitfield.",
+        sections: [{ id: PAYMENT, title: "Payment", body: "<p>$39,050.00 for Standing-seam metal, Dana Whitfield.</p>", place: "terms", initials: false, initialed: false }],
+      },
+      initials: null,
+    };
+    expect(patches).toEqual([{ option_id: BEST }, { status: "approved", approved_at: expect.any(String), approval }]);
+
+    // The option already shown: the status alone.
+    const second = supabase();
+    offering(second.db);
+    await call("full", "mark_quote", { quote_id: QUOTE, status: "approved", option_id: GOOD });
+    expect(writes(second.sent).map((s) => s.body)).toEqual([{ status: "approved", approved_at: expect.any(String), approval: expect.objectContaining({ option: expect.objectContaining({ id: GOOD, tier: "Good" }) }) }]);
+  });
+
+  it("are approved only for an option that has a price of its own", async () => {
+    const { db, sent } = supabase();
+    offering(db);
+    db.quotes![0]!.lines = db.quotes![0]!.lines.filter((l: Row) => l.option_id !== BEST);
+    expect((await call("full", "mark_quote", { quote_id: QUOTE, status: "approved", option_id: BEST })).error).toBe(
+      "That option isn't priced yet: it has no lines of its own. Add them in Jobly, or pick another one.",
+    );
+    expect(writes(sent)).toEqual([]);
+  });
+
+  it("put the option shown back when the approval doesn't go through", async () => {
+    const { db, sent } = supabase();
+    offering(db);
+    const stubbed = globalThis.fetch;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const approving = init?.method === "PATCH" && String(input).includes("/rest/v1/quotes") && "status" in JSON.parse(String(init.body));
+      return approving ? Response.json({ message: "This quote can't be approved right now.", code: "22023" }, { status: 400 }) : stubbed(input, init);
+    });
+    expect((await call("full", "mark_quote", { quote_id: QUOTE, status: "approved", option_id: BEST })).error).toBeDefined();
+    expect(writes(sent).map((s) => s.body)).toEqual([{ option_id: BEST }, { option_id: GOOD }]);
+    expect(db.quotes![0]!.option_id).toBe(GOOD);
+  });
+
+  it("aren't needed to approve a quote without them, which takes no option and keeps the contract it was sent", async () => {
+    const { db, sent } = supabase();
+    offering(db, { option_id: null, options: [] });
+    expect((await call("full", "mark_quote", { quote_id: QUOTE, status: "approved", option_id: GOOD })).error).toBe("This quote doesn't offer options, so leave out option_id.");
+    expect(await call("full", "mark_quote", { quote_id: QUOTE, status: "approved" })).toEqual({ saved: true });
+    const contract = { terms: "Thanks, Dana Whitfield.", sections: [{ id: PAYMENT, title: "Payment", body: "<p>$17,300.00 for , Dana Whitfield.</p>", place: "terms", initials: false, initialed: false }] };
+    expect(writes(sent).map((s) => s.body)).toEqual([{ status: "approved", approved_at: expect.any(String), approval: { name: "Assistant", method: "manual", template, option: null, contract, initials: null } }]);
+  });
+
+  it("keep a signed quote's own approval when it's marked approved again", async () => {
+    const { db, sent } = supabase();
+    offering(db, { option_id: null, options: [], status: "approved", approval: { name: "Dana Whitfield", signature: "data:image/png;base64,AAAA" } });
+    expect((await call("full", "mark_quote", { quote_id: QUOTE, status: "approved" })).error).toBe("The client has already answered this quote: it's approved already.");
+    db.quotes![0]!.status = "converted";
+    expect((await call("full", "mark_quote", { quote_id: QUOTE, status: "approved" })).error).toBe("The client has already answered this quote: it's a job already.");
+    // Nothing is written: the database would turn a new approval or approval date down anyway.
+    expect(writes(sent)).toEqual([]);
+  });
+
+  it("become a job straight from sent with the contract they were sent, approved by the assistant", async () => {
+    const { db, sent } = supabase();
+    offering(db, { option_id: null, options: [] });
+    const stubbed = globalThis.fetch;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).includes("/rest/v1/rpc/convert_quote_to_job") ? (sent.push({ method: "POST", table: "rpc/convert_quote_to_job", body: null }), Response.json("job-1")) : stubbed(input, init),
+    );
+    expect(await call("full", "convert_quote_to_job", { quote_id: QUOTE })).toEqual({ job_id: "job-1" });
+    const [approve, convert] = writes(sent);
+    expect(approve).toMatchObject({ method: "PATCH", table: "quotes", body: { approval: { name: "Assistant", method: "manual", template, option: null, initials: null } } });
+    expect(approve!.body.approval.contract.sections.map((s: Row) => s.body)).toEqual(["<p>$17,300.00 for , Dana Whitfield.</p>"]);
+    // The approval only: the database turns it into a job (and a change order joins its job) in one step.
+    expect(approve!.body).not.toHaveProperty("status");
+    expect(convert).toMatchObject({ table: "rpc/convert_quote_to_job" });
+  });
+
+  it("keep the deposit no more than the cheapest option's price", async () => {
+    const { db } = supabase();
+    offering(db);
+    const result = await call("full", "update_quote", { quote_id: QUOTE, deposit_amount: 20000 });
+    // The shingle roof comes to $17,300, the metal one to $39,050.
+    expect(result).toMatchObject({ deposit_amount: 17300, note: "The deposit was lowered to 17300: it can't be more than the quote's total (with options, its cheapest option's price)." });
+    expect(db.quotes![0]!.deposit_amount).toBe(17300);
+    // Within it, it's kept as it is.
+    expect(await call("full", "update_quote", { quote_id: QUOTE, deposit_amount: 5000 })).not.toHaveProperty("note");
+    expect(db.quotes![0]!.deposit_amount).toBe(5000);
+  });
+
+  it("aren't what a line group is: its lines are add-ons the client picks one of, the first picked", async () => {
+    const { db, sent } = supabase();
+    db.companies = [{ id: "company-1", settings: {} }];
+    await call("full", "create_quote", {
+      client_id: QUOTE,
+      title: "Gutters",
+      lines: [
+        { name: "Cleaning", unit_price: 150 },
+        { name: "5-inch gutters", unit_price: 1200, option_group: "Size" },
+        { name: "6-inch gutters", unit_price: 1500, option_group: "Size" },
+        { name: "Guards", unit_price: 600, optional: true },
+      ],
+    });
+    const lines = sent.find((s) => s.method === "POST" && s.table === "quote_line_items")!.body;
+    expect(lines.map((l: Row) => [l.name, l.optional, l.selected, l.option_group])).toEqual([
+      ["Cleaning", false, true, null],
+      ["5-inch gutters", true, true, "Size"],
+      ["6-inch gutters", true, false, "Size"],
+      ["Guards", true, false, null],
+    ]);
+  });
+});
+
+describe("automations about subs' offers", () => {
+  // An office person whose role has automations but not the Subcontractors area.
+  const clerk = () =>
+    supabase("office", {
+      memberships: [{ company_id: "company-1", role: "office", role_id: "role-clerk", company: { timezone: "America/New_York", settings: {} } }],
+      company_roles: [{ permissions: ["automations"] }],
+    });
+  const rule = { name: "Tell me", trigger: "sub_offer.declined", actions: [{ type: "notify", roles: ["owner"], title: "{{sub.name}} said no" }] };
+
+  it("aren't offered or made without the Subcontractors area", async () => {
+    const { sent } = clerk();
+    const options = await call("full", "automation_options", {});
+    expect(options.triggers.map((t: { trigger: string }) => t.trigger)).not.toContain("sub_offer.declined");
+    expect(options.triggers.map((t: { trigger: string }) => t.trigger)).toContain("quote.sent");
+    expect((await call("full", "save_automation", rule)).error).toMatch(/Subcontractors area/);
+    expect(sent.some((s) => s.table === "automation_rules" && s.method === "POST")).toBe(false);
+  });
+
+  it("tell only the office, and keep the sub's price out of a task, for someone with the area", async () => {
+    const { sent } = supabase("owner");
+    const options = await call("full", "automation_options", {});
+    expect(options.triggers.find((t: { trigger: string }) => t.trigger === "sub_offer.declined")).toMatchObject({
+      only_actions: ["notify", "create_task"], only_notify_roles: ["owner", "admin", "office"],
+      extra_tokens: expect.arrayContaining([{ token: "{{sub.price}}", label: "Their price", not_in_tasks: true }]),
+    });
+    expect((await call("full", "save_automation", { ...rule, actions: [{ type: "notify", roles: ["field_crew"], title: "x" }] })).error).toMatch(/only the office hears about this/);
+    expect((await call("full", "save_automation", { ...rule, actions: [{ type: "create_task", title: "Call {{sub.name}} about {{sub.price}}", days_from_now: 1 }] })).error).toMatch(/can't show the sub's price/);
+    expect(await call("full", "save_automation", rule)).toMatchObject({ does: "When a sub turns down a job offer: notify Owners." });
+    expect(sent.filter((s) => s.table === "automation_rules" && s.method === "POST")).toHaveLength(1);
+  });
+});
+
+describe("estimate templates", () => {
+  const SECTION = "0b8f6a52-3c1e-4d7a-9f2b-6e5d4c3b2a19";
+  const TEMPLATE = "7c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f";
+
+  it("change only what's sent, and keep one default", async () => {
+    const { db, sent } = supabase();
+    db.document_templates = [{ id: TEMPLATE, company_id: "company-1", name: "Standard", is_default: true, settings: { ...templateSettings({}), tagline: "Roofing · Gutters" } }];
+    db.contract_sections = [{ id: SECTION, company_id: "company-1", title: "Warranty" }];
+
+    expect(await call("full", "save_document_template", { template_id: TEMPLATE, footer: "Licensed and insured", invoice_sections: [SECTION] })).toEqual({ template_id: TEMPLATE, saved: true });
+    expect(db.document_templates[0].settings).toMatchObject({ tagline: "Roofing · Gutters", footer: "Licensed and insured", invoice_sections: [SECTION], header: "classic" });
+
+    expect((await call("full", "save_document_template", { name: "Storm work", make_default: true, color: "#2F6B3A" })).error).toBeUndefined();
+    const writes = sent.filter((s) => s.table === "document_templates" && s.method !== "GET");
+    // The old default steps down before the new one is saved.
+    expect(writes.slice(-2).map((s) => [s.method, s.body.is_default])).toEqual([["PATCH", false], ["POST", true]]);
+    expect(writes.at(-1)!.body.settings).toMatchObject({ color: "#2f6b3a", tagline: "" });
+  });
+
+  it("print only the business's own contract sections, written in Markdown", async () => {
+    const { db } = supabase();
+    expect((await call("full", "save_document_template", { sections: [SECTION] })).error).toMatch(/contract sections isn't here/);
+    expect(db.document_templates ?? []).toEqual([]);
+
+    expect((await call("full", "save_contract_section", { title: "Payment", body_markdown: "**{Total}** is due when the work is done.", place: "signatures" })).saved).toBe(true);
+    expect(db.contract_sections[0]).toMatchObject({ title: "Payment", place: "signatures", sort: 0, body: expect.stringContaining("<strong>{Total}</strong>") });
+  });
+
+  it("are an area of their own", async () => {
+    const { sent } = supabase();
+    expect((await call("jobsonly", "save_contract_section", { title: "Payment" })).error).toBe(assistantRefusal("templates"));
+    expect((await call("jobsonly", "save_document_template", { footer: "Thanks" })).error).toMatch(/can't change document styles and contract terms/);
+    expect(sent.filter((s) => ["document_templates", "contract_sections"].includes(s.table))).toEqual([]);
+  });
+});
+
+describe("marketing", () => {
+  const CAMPAIGN = "5a3e2c1d-9b8f-4e7a-8c6d-1f2e3d4c5b6a";
+
+  it("drafts a campaign for full access without money, saying how many it reaches", async () => {
+    const { db } = supabase("owner", { "rpc/campaign_audience": [{ client_id: "c-1" }, { client_id: "c-2" }] });
+    const saved = await call("nomoney", "save_campaign", { subject: "Spring cleanup", body: "Hi {{client.first_name}}, spots are open.", audience: { statuses: ["active"], cities: ["Oakridge", "oakridge"] } });
+    expect(saved).toMatchObject({ status: "draft", audience_count: 2 });
+    expect(db.campaigns[0]).toMatchObject({ name: "Untitled campaign", subject: "Spring cleanup", audience: { statuses: ["active"], cities: ["Oakridge"] } });
+  });
+
+  it("sends nothing while Marketing is uninstalled", async () => {
+    const { db, sent } = supabase();
+    db.companies = [{ id: "company-1", settings: {} }];
+    db.campaigns = [{ id: CAMPAIGN, company_id: "company-1", kind: "one_off", status: "draft", subject: "Spring", body: "Spots are open this spring." }];
+    expect((await call("full", "send_campaign", { campaign_id: CAMPAIGN })).error).toMatch(/^Marketing is off/);
+    expect(sent.filter((s) => s.table === "campaign_recipients" || (s.table === "campaigns" && s.method !== "GET"))).toEqual([]);
+  });
+
+  it("is for the office with the Marketing area", async () => {
+    supabase("field_crew");
+    expect((await call("full", "save_campaign", { subject: "Hi" })).error).toMatch(/Your role in Jobly doesn't allow that/);
+    expect((await call("full", "reply_to_review", { review_id: CAMPAIGN, comment: "Thank you!" })).error).toMatch(/Your role in Jobly doesn't allow that/);
+  });
+});
+
+describe("custom fields", () => {
+  it("sets a client's values by key, checked against its fields, keeping the import's source_id, and reads them back", async () => {
+    const { db } = supabase();
+    db.custom_field_definitions = [
+      { key: "pets", record_type: "client", label: "Pets on site", type: "yes_no", choices: [], archived_at: null },
+      { key: "unit", record_type: "client", label: "Unit", type: "choice", choices: ["Heat pump", "Furnace"], archived_at: null },
+    ];
+    db.clients.push({ id: "00000000-0000-4000-8000-0000000000c1", company_id: "company-1", display_name: "Ana Diaz", custom_fields: { source_id: "J-1", unit: "Furnace" } });
+    expect(await call("full", "update_client", { client_id: "00000000-0000-4000-8000-0000000000c1", custom_fields: { pets: "yes", unit: null } })).toEqual({ saved: true });
+    expect(db.clients[0]!.custom_fields).toEqual({ source_id: "J-1", pets: true });
+    expect((await call("full", "update_client", { client_id: "00000000-0000-4000-8000-0000000000c1", custom_fields: { unit: "Boiler" } })).error).toContain("Unit is one of: Heat pump, Furnace.");
+    expect((await call("full", "update_client", { client_id: "00000000-0000-4000-8000-0000000000c1", custom_fields: { source_id: "J-2" } })).error).toContain('no custom field "source_id"');
+    expect(db.clients[0]!.custom_fields).toEqual({ source_id: "J-1", pets: true });
+    const listed = await call("full", "list_clients", {});
+    expect(listed.clients[0]).toMatchObject({ source_id: "J-1", custom_fields: { pets: true } });
+    expect((await call("full", "list_custom_fields", {})).map((f: Row) => f.key)).toEqual(["pets", "unit"]);
+  });
+});
+
+describe("quote templates and deposits", () => {
+  const QUOTE = "6f4cc1b2-7e43-4c1d-9a8e-3c2f1d0b9a87";
+  const TEMPLATE = "6f4cc1b2-7e43-4c1d-9a8e-3c2f1d0b9a88";
+  const CLIENT = "6f4cc1b2-7e43-4c1d-9a8e-3c2f1d0b9a89";
+  const quote = (extra: Row = {}) => ({
+    id: QUOTE, number: 7, status: "draft", is_template: false, subtotal: 1000, discount_amount: 0, tax_amount: 0, total: 1000, deposit_amount: 0, deposit_percent: null, tax_rate: 0, promo: null, lines: [], options: [], ...extra,
+  });
+
+  it("list templates apart from quotes", async () => {
+    const { sent } = supabase();
+    await call("full", "list_quotes", {});
+    await call("full", "list_quotes", { templates: true });
+    expect(sent.filter((s) => s.table === "quotes").map((s) => s.query!.get("is_template"))).toEqual(["eq.false", "eq.true"]);
+  });
+
+  it("set the deposit as a percent, or as an amount, which stops it being one", async () => {
+    const { db, sent } = supabase();
+    db.quotes = [quote()];
+    await call("full", "update_quote", { quote_id: QUOTE, deposit_percent: 25 });
+    await call("full", "update_quote", { quote_id: QUOTE, deposit_amount: 300 });
+    expect(sent.filter((s) => s.method === "PATCH" && s.table === "quotes").map((s) => s.body)).toEqual([{ deposit_percent: 25 }, { deposit_amount: 300, deposit_percent: null }]);
+    expect(await call("full", "update_quote", { quote_id: QUOTE, deposit_amount: 300, deposit_percent: 25 })).toEqual({ error: "Give the deposit as an amount or as a percent, not both." });
+    expect((await call("full", "update_quote", { quote_id: QUOTE, deposit_percent: 101 })).error).toMatch(/deposit_percent/);
+  });
+
+  it("make a quote from a template for a client, as New from template does", async () => {
+    const { db, sent } = supabase();
+    db.companies = [{ id: "company-1", settings: {} }];
+    db.quotes = [quote({ id: TEMPLATE, is_template: true, number: null })];
+    await call("full", "create_quote", { template_id: TEMPLATE, client_id: CLIENT, title: "Cleanup for Bo" });
+    expect(sent.filter((s) => s.table === "rpc/duplicate_quote").map((s) => s.body)).toEqual([{ p_quote: TEMPLATE, p_client: CLIENT, p_title: "Cleanup for Bo" }]);
+    // Never a quote passed off as a template, nor one without its client.
+    db.quotes = [quote()];
+    expect(await call("full", "create_quote", { template_id: QUOTE, client_id: CLIENT })).toEqual({ error: "That's a quote, not a quote template. list_quotes with templates lists them." });
+    expect((await call("full", "create_quote", { template_id: TEMPLATE, title: "No client" })).error).toMatch(/give template_id and client_id/);
+    expect(sent.filter((s) => s.table === "rpc/duplicate_quote")).toHaveLength(1);
+  });
+});
+
+describe("duplicate clients", () => {
+  const KEEP = "6f4cc1b2-7e43-4c1d-9a8e-3c2f1d0b9a90";
+  const MERGE = "6f4cc1b2-7e43-4c1d-9a8e-3c2f1d0b9a91";
+
+  it("are listed with who they are and why they matched", async () => {
+    const clients = [{ id: KEEP, display_name: "Kay Keep" }, { id: MERGE, display_name: "Kay K." }];
+    supabase("owner", { "rpc/client_duplicates": [{ client_id: KEEP, other_id: MERGE, reasons: [{ kind: "email", value: "kay@example.com" }], clients }] });
+    const listed = await call("full", "list_duplicate_clients", {});
+    expect(listed.pairs).toEqual([{ clients, reasons: [{ kind: "email", value: "kay@example.com" }] }]);
+  });
+
+  it("are merged only with full access, since one is deleted and invoices move", async () => {
+    const { sent } = supabase();
+    expect((await call("jobsonly", "merge_clients", { keep_id: KEEP, merge_id: MERGE })).error).toBe(assistantRefusal("invoices", true, { level: "areas", areas: ["jobs", "clients"] }));
+    expect((await call("nomoney", "merge_clients", { keep_id: KEEP, merge_id: MERGE })).error).toMatch(/^This assistant can't change money/);
+    expect(sent.filter((s) => s.table === "rpc/merge_clients")).toEqual([]);
+    await call("full", "merge_clients", { keep_id: KEEP, merge_id: MERGE });
+    expect(sent.filter((s) => s.table === "rpc/merge_clients").map((s) => s.body)).toEqual([{ p_company: "company-1", p_keep: KEEP, p_merge: MERGE }]);
+  });
+});

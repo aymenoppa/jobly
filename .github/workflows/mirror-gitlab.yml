@@ -1,0 +1,32 @@
+name: Mirror to GitLab
+
+# Keeps gitlab.com/aymenoppa/jobly a read-only copy of this repository: after every push or delete
+# here, its branches and tags are pushed there as they are on GitHub. GitHub stays the source of
+# truth, so nothing is ever changed on GitLab directly.
+#
+# It pushes with a GitLab deploy key that can write to that one project only (GitLab, Settings,
+# Repository, Deploy keys), kept here in the GITLAB_DEPLOY_KEY secret.
+on: [push, delete]
+
+permissions:
+  contents: read
+
+# A newer run copies everything an older one would, so an older run never pushes after it.
+concurrency:
+  group: mirror-gitlab
+  cancel-in-progress: true
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          KEY: ${{ secrets.GITLAB_DEPLOY_KEY }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # gitlab.com's published host key, so the push can't go to anyone else
+          echo "gitlab.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAfuCHKVTjquxvt6CM6tdG4SLp1Btn/nOeHHE5UOzRdf" > ~/.ssh/known_hosts
+          git clone --bare --quiet "https://github.com/$GITHUB_REPOSITORY.git" repo
+          git -C repo push --force --prune git@gitlab.com:aymenoppa/jobly.git 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'

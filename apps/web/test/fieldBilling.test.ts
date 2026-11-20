@@ -1,0 +1,197 @@
+/**
+ * Finishing the paperwork on site (features/field/fieldMoney.ts and FieldBilling.tsx): by role, who
+ * adds work, and who makes the invoice, sees its total and records cash or check; work added sends
+ * the item and how many, never a price, and waits on the phone without one; cash or check goes the
+ * office's own Record payment way (features/invoices/recordPayment.ts).
+ */
+import { memberPermissions, ROLES, STAFF, type Role } from "@jobly/core/roles";
+import { onlineManager, QueryClient } from "@tanstack/react-query";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const calls = vi.hoisted(() => [] as Array<{ op: string; on: string; args: unknown }>);
+/** What the database answers a payment with: an error for the insert, and the row already there under its id. */
+const answers = vi.hoisted(() => ({ insertError: null as { code: string; message: string } | null, recorded: null as { amount: number } | null }));
+vi.mock("../src/lib/api", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../src/lib/api")>();
+  const done = Promise.resolve({ data: null, error: null });
+  const from = (on: string) => {
+    const q = {
+      update: (args: unknown) => (calls.push({ op: "update", on, args }), q),
+      insert: (args: unknown) => (calls.push({ op: "insert", on, args }), Promise.resolve({ data: null, error: answers.insertError })),
+      select: () => ({ eq: () => ({ maybeSingle: () => Promise.resolve({ data: answers.recorded, error: null }) }) }),
+      eq: () => done,
+    };
+    return q;
+  };
+  const rpc = (on: string, args: unknown) => (calls.push({ op: "rpc", on, args }), Promise.resolve({ data: "line-1", error: null }));
+  return { ...real, supabase: () => ({ from, rpc }) };
+});
+
+const { addsToVisit, addsWork, fieldInvoiceKind, takesMoney, takesWork } = await import("../src/features/field/fieldMoney");
+const { addJobLine, pendingJobLines, pendingVisitExtras, waitingScopeLine } = await import("../src/features/field/fieldActions");
+const { waitingExtra, withWaitingExtras } = await import("../src/features/field/FieldExtras");
+const { recordPayment } = await import("../src/features/invoices/recordPayment");
+
+/** A member as the session has them: their level's areas, or their custom role's within it. */
+const member = (role: Role, custom?: string[]) => ({ role, permissions: memberPermissions(role, custom) });
+const sealing = { visitId: "v1", jobId: "j1", lineId: "line-1", serviceId: "s1", quantity: 40, name: "Crack seal", unit: "lf" };
+
+beforeEach(() => void calls.splice(0));
+afterEach(() => onlineManager.setOnline(true));
+
+describe("who sees the money on site", () => {
+  it("makes the invoice, sees its total and records cash or check: owners, admins and office", () => {
+    expect(ROLES.filter((role) => takesMoney(member(role)))).toEqual(["owner", "admin", "office"]);
+  });
+
+  it("not an office or admin role with invoices switched off", () => {
+    expect(takesMoney(member("office", ["schedule", "settings"]))).toBe(false);
+    expect(takesMoney(member("admin", ["reports", "team"]))).toBe(false);
+    expect(takesMoney(member("office", ["invoices"]))).toBe(true);
+  });
+
+  it("never crews, estimators or subs, whatever their role lists: their level can't have invoices", () => {
+    for (const role of ["crew_lead", "field_crew", "estimator", "subcontractor"] as const) expect(takesMoney(member(role, ["invoices", "job_costs"])), role).toBe(false);
+  });
+
+  it("the team adds work from the price list, a sub never does", () => {
+    expect(ROLES.filter((role) => addsWork(member(role)))).toEqual([...STAFF]);
+  });
+
+  it("work goes on a job still open, one-off or repeating, not a closed one", () => {
+    expect(takesWork({ kind: "one_off", status: "active" })).toBe(true);
+    expect(takesWork({ kind: "one_off", status: "requires_invoicing" })).toBe(true);
+    expect(takesWork({ kind: "recurring", status: "active" })).toBe(true);
+    expect(takesWork({ kind: "one_off", status: "completed" })).toBe(false);
+    expect(takesWork({ kind: "recurring", status: "archived" })).toBe(false);
+  });
+
+  it("on a repeating job it's extra work on that visit alone (its lines bill every visit); on a one-off job, a line on the job", () => {
+    expect(addsToVisit({ kind: "recurring" })).toBe(true);
+    expect(addsToVisit({ kind: "one_off" })).toBe(false);
+  });
+
+  it("Create invoice makes what the job page offers first: the final invoice, or the visits; none for a fixed price billed monthly", () => {
+    expect(fieldInvoiceKind({ kind: "one_off", pricing: null })).toBe("standard");
+    expect(fieldInvoiceKind({ kind: "recurring", pricing: "per_visit" })).toBe("visits");
+    expect(fieldInvoiceKind({ kind: "recurring", pricing: "fixed" })).toBeNull();
+  });
+});
+
+describe("adding work from the field", () => {
+  it("sends the item and how many, never a price: the office's applies", async () => {
+    await addJobLine(sealing);
+    expect(calls).toEqual([{ op: "rpc", on: "add_field_line", args: { p_visit: "v1", p_service: "s1", p_quantity: 40, p_id: "line-1" } }]);
+  });
+
+  it("shows on the visit while it waits with what the crew sees of any line: no price", () => {
+    expect(waitingScopeLine(sealing)).toEqual({ id: "line-1", name: "Crack seal", description: null, quantity: 40, unit: "lf", sort: Number.MAX_SAFE_INTEGER });
+  });
+
+  it("waits on the phone with no signal, and the job's list of work finds it there", async () => {
+    const qc = new QueryClient();
+    qc.mount();
+    onlineManager.setOnline(false);
+    const queue = (v: object) => void qc.getMutationCache().build(qc, { mutationKey: ["job-line-add"], networkMode: "online", mutationFn: async () => undefined }).execute(v);
+    queue(sealing);
+    queue({ ...sealing, jobId: "j2", lineId: "line-2" });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(pendingJobLines(qc, "j1").map((l) => l.lineId)).toEqual(["line-1"]);
+    expect(calls).toEqual([]);
+    qc.unmount();
+  });
+});
+
+describe("adding extra work to a visit of a repeating job", () => {
+  const mulch = { ...sealing, visitId: "v9", jobId: "j9", lineId: "line-9", name: "Mulch", unit: "yd", quantity: 2, extra: true };
+
+  it("goes the same way, by item and quantity with no price: the database puts it on the visit, not the job", async () => {
+    await addJobLine(mulch);
+    expect(calls).toEqual([{ op: "rpc", on: "add_field_line", args: { p_visit: "v9", p_service: "s1", p_quantity: 2, p_id: "line-9" } }]);
+  });
+
+  it("waits on the phone with no signal, and shows with that visit's extra work, not in the job's list of work", async () => {
+    const qc = new QueryClient();
+    qc.mount();
+    onlineManager.setOnline(false);
+    const queue = (v: object) => void qc.getMutationCache().build(qc, { mutationKey: ["job-line-add"], networkMode: "online", mutationFn: async () => undefined }).execute(v);
+    queue(mulch);
+    queue({ ...mulch, visitId: "v10", lineId: "line-10" });
+    queue({ ...sealing, jobId: "j9", visitId: "v9" });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(pendingVisitExtras(qc, "v9").map((l) => l.lineId)).toEqual(["line-9"]);
+    expect(pendingJobLines(qc, "j9").map((l) => l.lineId)).toEqual(["line-1"]);
+    expect(calls).toEqual([]);
+    qc.unmount();
+  });
+
+  it("is listed once: after what the server has, until the server has it too", () => {
+    const office = { id: "x1", name: "Aeration", description: null, quantity: 1, unit: "ea", added_in_field: false };
+    expect(waitingExtra(mulch)).toEqual({ id: "line-9", name: "Mulch", description: null, quantity: 2, unit: "yd", added_in_field: true, waiting: true });
+    expect(withWaitingExtras([office], [mulch]).map((l) => l.id)).toEqual(["x1", "line-9"]);
+    const sent = { ...waitingExtra(mulch), waiting: undefined };
+    expect(withWaitingExtras([office, sent], [mulch])).toEqual([office, sent]);
+  });
+
+  it("the visit's page offers it on a repeating job's visit until that visit is on an invoice", () => {
+    const page = readFileSync(fileURLToPath(new URL("../src/features/field/FieldVisitPage.tsx", import.meta.url)), "utf8");
+    expect(page).toContain("!(addsToVisit(v.job) && v.invoice_id) && <AddWork visitId={v.id} jobId={v.job.id} toVisit={addsToVisit(v.job)} />");
+    expect(page).toContain("{addsToVisit(v.job) && <VisitExtraScope visitId={v.id} />}");
+  });
+});
+
+describe("cash or check", () => {
+  const draft = { id: "i1", client_id: "cl1", balance: 400, draft: true };
+
+  it("goes the office's Record payment way: a draft is marked sent, then the payment with its check number", async () => {
+    await recordPayment({ id: "p1", companyId: "c1", currency: "USD", invoice: draft, amount: 150, method: "check", receivedAt: "2026-11-03T15:00:00.000Z", notes: "1042 · Left in the mailbox" });
+    expect(calls).toEqual([
+      { op: "update", on: "invoices", args: { status: "sent" } },
+      { op: "insert", on: "payments", args: { id: "p1", company_id: "c1", invoice_id: "i1", client_id: "cl1", amount: 150, tip_amount: 0, method: "check", received_at: "2026-11-03T15:00:00.000Z", notes: "1042 · Left in the mailbox" } },
+    ]);
+  });
+
+  it("turns down more than is owed, or nothing, before anything is written", async () => {
+    await expect(recordPayment({ id: "p1", companyId: "c1", currency: "USD", invoice: draft, amount: 500, method: "cash", receivedAt: "2026-11-03T15:00:00.000Z", notes: null })).rejects.toThrow("That's more than the $400.00 balance.");
+    await expect(recordPayment({ id: "p1", companyId: "c1", currency: "USD", invoice: draft, amount: 0, method: "cash", receivedAt: "2026-11-03T15:00:00.000Z", notes: null })).rejects.toThrow("greater than zero");
+    expect(calls).toEqual([]);
+  });
+
+  describe("sent twice", () => {
+    const sent = { id: "p1", companyId: "c1", currency: "USD", invoice: { ...draft, draft: false }, amount: 150, method: "cash" as const, receivedAt: "2026-11-03T15:00:00.000Z", notes: null };
+    const duplicate = { code: "23505", message: 'duplicate key value violates unique constraint "payments_pkey"' };
+    afterEach(() => Object.assign(answers, { insertError: null, recorded: null }));
+
+    it("is one payment: every try sends the id the form made, and the one already there counts as recorded", async () => {
+      await recordPayment(sent);
+      Object.assign(answers, { insertError: duplicate, recorded: { amount: 150 } });
+      await expect(recordPayment(sent)).resolves.toBeUndefined();
+      expect(calls.map((c) => (c.args as { id: string }).id)).toEqual(["p1", "p1"]);
+    });
+
+    it("counts as recorded when the payment that's there can't be read back", async () => {
+      Object.assign(answers, { insertError: duplicate, recorded: null });
+      await expect(recordPayment(sent)).resolves.toBeUndefined();
+    });
+
+    it("says so when the amount was changed after the first try went through", async () => {
+      Object.assign(answers, { insertError: duplicate, recorded: { amount: 100 } });
+      await expect(recordPayment(sent)).rejects.toThrow("This payment is already recorded, as $100.00. Close this and check the invoice.");
+    });
+
+    it("shows what the database says when someone else just recorded it", async () => {
+      answers.insertError = { code: "22023", message: "Nothing is left to pay on this invoice. Check its payments: this one may already be recorded" };
+      await expect(recordPayment(sent)).rejects.toThrow("Nothing is left to pay on this invoice. Check its payments: this one may already be recorded");
+    });
+  });
+
+  it("the office's and the field app's forms each make the payment's id once, when they open", () => {
+    for (const file of ["../src/features/invoices/InvoicePage.tsx", "../src/features/field/FieldBilling.tsx"]) {
+      const source = readFileSync(fileURLToPath(new URL(file, import.meta.url)), "utf8");
+      expect(source).toContain("const [paymentId] = useState(() => crypto.randomUUID());");
+      expect(source).toContain("id: paymentId,");
+    }
+  });
+});

@@ -1,0 +1,127 @@
+name: Release
+
+# Publishes the images every Jobly instance on Railway runs, when a version tag is pushed:
+#
+#   git tag v0.1.2 && git push origin v0.1.2
+#
+#   ghcr.io/aymenoppa/jobly:0.1.2, and :latest       the jobly service (the root Dockerfile)
+#   ghcr.io/aymenoppa/jobly-db:0.1.2, and :pg17      the db service (deploy/postgres), only when it changed
+#
+# Instances run the moving tags (latest, and pg17 for the db's Postgres version), so every release
+# installs itself whatever its number, 0.2.0 and 1.0.0 included. The moving tags only go to the
+# highest version, so a fix released for an older line (0.1.9 after 0.2.0) doesn't take instances
+# back. See deploy/README.md, "Updates".
+#
+# Instances install a release unattended within hours, so nothing is published until the tagged
+# commit is known to be on main and every check in ci.yml has passed for that exact commit.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # A tag can be put on any commit. Only main's are released: a tag on a branch, or on a commit that
+  # was never merged, would otherwise reach every instance.
+  on-main:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The tagged commit is on main
+        run: |
+          git fetch --quiet origin '+refs/heads/main:refs/remotes/origin/main'
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "$GITHUB_REF_NAME is on commit $(git rev-parse HEAD), which isn't on main. Nothing is published." >&2
+            exit 1
+          fi
+
+  # Every check CI runs, for the tagged commit: a called workflow checks out its caller's ref, the
+  # tag. It needs nothing from the registry, so it doesn't get to write there.
+  ci:
+    needs: on-main
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  images:
+    needs: [on-main, ci]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Version
+        id: version
+        env:
+          DB_IMAGE: ghcr.io/${{ github.repository }}-db
+        run: |
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          # The db's moving tag names its Postgres major version: an instance can't move to a new one
+          # unattended (its data has to be upgraded), so a new major gets a new tag (pg18).
+          postgres=$(sed -nE 's/^FROM .*postgres:([0-9]+)\..*/\1/p' deploy/postgres/Dockerfile)
+          if [ -z "$postgres" ]; then
+            echo "No Postgres version in the FROM line of deploy/postgres/Dockerfile" >&2
+            exit 1
+          fi
+          echo "db_tag=pg$postgres" >> "$GITHUB_OUTPUT"
+          # A new database image restarts every instance's database, so publish one only when
+          # deploy/postgres changed since the previous release (or there's none yet), or when its
+          # moving tag doesn't exist yet.
+          previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$GITHUB_REF_NAME^" 2>/dev/null || true)
+          if [ -z "$previous" ] || ! git diff --quiet "$previous" "$GITHUB_REF_NAME" -- deploy/postgres \
+            || ! docker buildx imagetools inspect "$DB_IMAGE:pg$postgres" > /dev/null 2>&1; then
+            echo "db=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Previous release: ${previous:-none}"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: JOBLY_VERSION=${{ steps.version.outputs.version }}
+          tags: ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - if: steps.version.outputs.db
+        uses: docker/build-push-action@v6
+        with:
+          context: deploy/postgres
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository }}-db:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+      - name: Move the moving tags
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DB: ${{ steps.version.outputs.db }}
+          DB_TAG: ${{ steps.version.outputs.db_tag }}
+        run: |
+          # Checked now rather than at the start, in case a higher version was pushed during the build.
+          git fetch --tags --force --quiet
+          highest=$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          if [ "$highest" != "$GITHUB_REF_NAME" ]; then
+            echo "$highest is a higher version, so the moving tags stay where they are."
+            exit 0
+          fi
+          docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:$VERSION"
+          if [ -n "$DB" ]; then
+            docker buildx imagetools create --tag "$IMAGE-db:$DB_TAG" "$IMAGE-db:$VERSION"
+          fi

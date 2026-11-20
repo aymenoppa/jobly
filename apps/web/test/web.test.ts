@@ -1,0 +1,124 @@
+import { describe, expect, it } from "vitest";
+import { companyFeatures, textFilter } from "../src/lib/api";
+import { parseCsv, toCsv } from "../src/lib/csv";
+import { bucketize, bucketizeShifted, bucketsFor, resolveRange } from "../src/features/finance/range";
+import { previousRange } from "@jobly/core/reports";
+
+describe("report ranges", () => {
+  const tz = "America/New_York";
+
+  it("resolves presets to inclusive local dates", () => {
+    expect(resolveRange("month", "2026-10-16", tz)).toMatchObject({ from: "2026-10-01", to: "2026-10-16", days: 16 });
+    expect(resolveRange("last_month", "2026-03-10", tz)).toMatchObject({ from: "2026-02-01", to: "2026-02-28" });
+    expect(resolveRange("last_month", "2026-01-05", tz)).toMatchObject({ from: "2025-12-01", to: "2025-12-31" });
+    expect(resolveRange("quarter", "2026-08-20", tz)).toMatchObject({ from: "2026-07-01", to: "2026-08-20" });
+    expect(resolveRange("year", "2026-10-16", tz)).toMatchObject({ from: "2026-01-01" });
+    expect(resolveRange("last_year", "2026-10-16", tz)).toMatchObject({ from: "2025-01-01", to: "2025-12-31", days: 365 });
+    expect(resolveRange("30d", "2026-10-16", tz)).toMatchObject({ from: "2026-09-17", days: 30 });
+  });
+
+  it("uses the company's zone for timestamp boundaries", () => {
+    const r = resolveRange("month", "2026-10-16", tz);
+    expect(r.start).toBe("2026-10-01T04:00:00.000Z"); // midnight EDT
+    expect(r.end).toBe("2026-10-17T04:00:00.000Z");
+  });
+
+  it("cleans up custom ranges", () => {
+    expect(resolveRange("custom", "2026-10-16", tz, { from: "2026-05-10", to: "2026-05-01" })).toMatchObject({ from: "2026-05-01", to: "2026-05-10" });
+    expect(resolveRange("custom", "2026-10-16", tz, { from: "garbage", to: null })).toMatchObject({ from: "2026-09-17", to: "2026-10-16" });
+  });
+
+  it("buckets by day, week or month depending on length", () => {
+    expect(bucketsFor(resolveRange("month", "2026-10-16", tz))).toHaveLength(16);
+    const weeks = bucketsFor(resolveRange("90d", "2026-10-16", tz));
+    expect(weeks.length).toBeGreaterThanOrEqual(13);
+    expect(weeks[0]!.from).toBe("2026-07-19");
+    expect(bucketsFor(resolveRange("year", "2026-10-16", tz)).map((b) => b.label)).toEqual(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct"]);
+  });
+
+  it("sums rows into buckets using local dates", () => {
+    const buckets = bucketsFor(resolveRange("month", "2026-10-16", tz));
+    // 11:30pm on Oct 1 in New York is Oct 2 in UTC; it belongs to Oct 1.
+    const totals = bucketize([{ at: "2026-10-02T03:30:00Z", n: 5 }, { at: "2026-10-03", n: 2 }, { at: "2026-11-01", n: 9 }], buckets, (r) => r.at, (r) => r.n, tz);
+    expect(totals[0]).toBe(5);
+    expect(totals[2]).toBe(2);
+    expect(totals.reduce((a, b) => a + b, 0)).toBe(7);
+  });
+
+  it("lines the previous period up under this one", () => {
+    const range = resolveRange("month", "2026-10-16", tz);
+    const before = previousRange(range);
+    expect(before).toMatchObject({ from: "2026-09-15", to: "2026-09-30" });
+    const buckets = bucketsFor(range);
+    // Sep 15 is the previous period's first day, so it sits under Oct 1; 11:30pm Sep 30 in New York under Oct 16.
+    const totals = bucketizeShifted([{ at: "2026-09-15", n: 4 }, { at: "2026-10-01T03:30:00Z", n: 6 }, { at: "2026-09-14", n: 9 }], buckets, (r) => r.at, (r) => r.n, tz, range.days);
+    expect(totals[0]).toBe(4);
+    expect(totals[15]).toBe(6);
+    expect(totals.reduce((a, b) => a + b, 0)).toBe(10);
+  });
+});
+
+describe("csv", () => {
+  it("round-trips quotes, commas and new lines", () => {
+    const csv = toCsv([{ name: 'Smith, "Bob"', note: "line 1\nline 2" }], [{ key: "name", label: "Name" }, { key: "note", label: "Note" }]);
+    expect(parseCsv(csv)).toEqual([["Name", "Note"], ['Smith, "Bob"', "line 1\nline 2"]]);
+  });
+
+  it("defuses spreadsheet formulas but keeps negative numbers", () => {
+    const csv = toCsv([{ a: "=HYPERLINK(1)", b: -250.5, c: "-12", d: "+1 540 555" }], ["a", "b", "c", "d"].map((k) => ({ key: k, label: k })));
+    expect(csv.split("\r\n")[1]).toBe("'=HYPERLINK(1),-250.5,-12,'+1 540 555");
+  });
+});
+
+describe("what's on for a business", () => {
+  const off = { ai: false, payments: false, email: false, sms: false, roofInsights: false, devMail: true };
+
+  it("turns AI on with the business's own Anthropic key, without one on the server", () => {
+    expect(companyFeatures(off, { ai_connected: true }).ai).toBe(true);
+    expect(companyFeatures(off, {}).ai).toBe(false);
+    expect(companyFeatures({ ...off, ai: true }, { ai_connected: false }).ai).toBe(true);
+  });
+
+  it("turns email on with the business's own mailbox, which also ends test mode", () => {
+    expect(companyFeatures(off, { email_connected: true })).toMatchObject({ email: true, devMail: false });
+    expect(companyFeatures(off, {})).toMatchObject({ email: false, devMail: true });
+  });
+
+  it("turns texting on with the business's own Twilio account, without one on the server", () => {
+    expect(companyFeatures(off, { sms_connected: true }).sms).toBe(true);
+    expect(companyFeatures(off, {}).sms).toBe(false);
+    // The server's account texts for every business that hasn't connected its own.
+    expect(companyFeatures({ ...off, sms: true }, { sms_connected: false }).sms).toBe(true);
+    // Whether the sign-in page offers a code by text is the whole Jobly's, as for email.
+    expect(companyFeatures({ ...off, smsCodes: true }, {})).toMatchObject({ sms: false, smsCodes: true });
+  });
+
+  it("keeps whether a sub can get a sign-in code by email, which is for the whole Jobly", () => {
+    expect(companyFeatures({ ...off, emailCodes: true }, {}).emailCodes).toBe(true);
+    expect(companyFeatures({ ...off, emailCodes: false }, { email_connected: true })).toMatchObject({ emailCodes: false, email: true });
+  });
+});
+
+describe("search boxes' filter", () => {
+  const cols = ["display_name", "email", "phone"];
+
+  it("keeps what was typed, quoted, so dots, commas and apostrophes still match", () => {
+    expect(textFilter(" joe@acme.com ", cols)).toBe('display_name.ilike."%joe@acme.com%",email.ilike."%joe@acme.com%",phone.ilike."%joe@acme.com%"');
+    expect(textFilter("O'Brien, Jr.", ["display_name"])).toBe(`display_name.ilike."%O'Brien, Jr.%"`);
+    expect(textFilter('say "hi" \\o/', ["display_name"])).toBe('display_name.ilike."%say \\"hi\\" \\\\o/%"');
+    expect(textFilter("100%*", ["display_name"])).toBe('display_name.ilike."%100%"');
+    expect(textFilter("  ", cols)).toBeNull();
+  });
+
+  it("finds a phone by its digits however it's laid out", () => {
+    const regex = (typed: string) => new RegExp(/phone\.imatch\."([^"]+)"/.exec(textFilter(typed, cols) ?? "")?.[1] ?? "^$", "i");
+    for (const typed of ["5551234567", "+1 (555) 123-4567", "555.123.4567", "123-4567"]) {
+      expect(regex(typed).test("(555) 123-4567"), typed).toBe(true);
+      expect(regex(typed).test("+1 555 123 4567"), typed).toBe(true);
+    }
+    expect(regex("5551234567").test("(555) 123-4568")).toBe(false);
+    expect(textFilter("555", cols)).not.toContain("imatch");
+    expect(textFilter("5551234567", ["display_name"])).not.toContain("imatch");
+    expect(textFilter("Unit 1234", cols)).not.toContain("imatch");
+  });
+});

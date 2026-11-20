@@ -1,0 +1,1679 @@
+import { addDays, driveBetween, etaWords, VISIT_HORIZON_DAYS } from "@jobly/core";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { app } from "../src/app";
+import type { Env } from "../src/env";
+import { runAccountingJob, SentButUnrecorded } from "../src/integrations/accounting";
+import { accessToken } from "../src/integrations/tokens";
+import { decryptJson, encryptJson, signToken } from "../src/lib/crypto";
+import { readClientLink } from "../src/lib/links";
+import type { Db } from "../src/lib/supabase";
+import { processAutomations, visitTime } from "../src/services/automations";
+import { arrivalTime, planDay } from "../src/services/routes";
+import { updateVisit } from "../src/services/schedule";
+import { materializeJob, runTask } from "../src/tasks";
+
+// The background tasks and the routes here make their own clients; they get the test's fake instead.
+const current = vi.hoisted(() => ({ db: null as unknown }));
+vi.mock("../src/lib/supabase", async (original) => ({
+  ...(await original<typeof import("../src/lib/supabase")>()),
+  adminClient: () => current.db,
+  userClient: () => current.db,
+}));
+// Autopay invites are their own service (services/autopay.ts); here only the engine's part is tested.
+const invites = vi.hoisted(() => ({
+  send: null as null | ((input: Record<string, unknown>) => Promise<{ sent: boolean; detail: string }>),
+  calls: [] as Array<Record<string, unknown>>,
+  available: false,
+}));
+vi.mock("../src/services/autopay", async (original) => ({
+  ...(await original<typeof import("../src/services/autopay")>()),
+  sendAutopayInvite: async (_env: unknown, _admin: unknown, input: Record<string, unknown>) => {
+    invites.calls.push(input);
+    if (!invites.send) throw new Error("No invite expected.");
+    return invites.send(input);
+  },
+  autopayAvailable: async () => invites.available,
+}));
+
+const env: Env = {
+  SUPABASE_URL: "https://example.supabase.co",
+  SUPABASE_PUBLISHABLE_KEY: "sb_publishable_test",
+  SUPABASE_SECRET_KEY: "sb_secret_test",
+  ENCRYPTION_KEY: btoa(String.fromCharCode(...new Uint8Array(32).map((_, i) => i * 7))),
+  QUICKBOOKS_CLIENT_ID: "qb-client",
+  QUICKBOOKS_CLIENT_SECRET: "qb-secret",
+  ZOHO_CLIENT_ID: "zoho-client",
+  ZOHO_CLIENT_SECRET: "zoho-secret",
+};
+const COMPANY = "00000000-0000-4000-8000-000000000001";
+
+/** One query the fake database was asked: its table and each builder call, in order. */
+interface Query {
+  table: string;
+  calls: Array<[string, ...any[]]>;
+}
+type Answer = { data?: unknown; error?: { message: string } | null };
+
+const call = (q: Query, name: string) => q.calls.find(([n]) => n === name);
+const verb = (q: Query) => q.calls.find(([n]) => ["insert", "upsert", "update", "delete"].includes(n))?.[0] ?? "select";
+
+/** Stands in for supabase-js: records every query and rpc, and answers each with the test's handlers. */
+function fakeDb(answer: (q: Query) => Answer = () => ({}), rpc: (fn: string, args: Record<string, any>) => Answer = () => ({})) {
+  const queries: Query[] = [];
+  const rpcs: Array<{ fn: string; args: Record<string, any> }> = [];
+  const chain = (q: Query): unknown =>
+    new Proxy(
+      {},
+      {
+        get: (_, name) =>
+          name === "then"
+            ? (resolve: (value: unknown) => unknown, reject: (reason: unknown) => unknown) =>
+                Promise.resolve()
+                  .then(() => ({ data: null, error: null, ...answer(q) }))
+                  .then(resolve, reject)
+            : (...args: unknown[]) => {
+                q.calls.push([String(name), ...args]);
+                return chain(q);
+              },
+      },
+    );
+  const db = {
+    from: (table: string) => {
+      const q: Query = { table, calls: [] };
+      queries.push(q);
+      return chain(q);
+    },
+    rpc: async (fn: string, args: Record<string, any>) => {
+      rpcs.push({ fn, args });
+      return { data: null, error: null, ...rpc(fn, args) };
+    },
+    auth: { getClaims: async () => ({ data: { claims: { sub: "00000000-0000-4000-8000-0000000000aa" } }, error: null }) },
+  };
+  current.db = db;
+  return { db: db as unknown as Db, queries, rpcs };
+}
+
+/** What Supabase's API does with a select: the range asked for, but never more than 1,000 rows. */
+function upTo1000<T>(rows: T[], q: Query): Answer {
+  const range = call(q, "range");
+  const from = range?.[1] ?? 0;
+  const to = Math.min(range?.[2] ?? Infinity, from + 999);
+  return { data: rows.slice(from, to + 1) };
+}
+
+/** A query that answers every builder call with itself, and `then` with `rows` (or `single` for maybeSingle/single). */
+function fakeChain(rows: unknown, single: { data: unknown } = { data: rows }): unknown {
+  let one = false;
+  const chain: unknown = new Proxy(
+    {},
+    {
+      get: (_, name) =>
+        name === "then"
+          ? (resolve: (value: unknown) => unknown) => resolve({ error: null, ...(one ? single : { data: rows }) })
+          : () => {
+              if (name === "maybeSingle" || name === "single") one = true;
+              return chain;
+            },
+    },
+  );
+  return chain;
+}
+
+/** The dates of every visit a run asked the database to add, in order (it adds them a hundred at a time). */
+const upsertedKeys = (queries: Query[]) =>
+  queries.filter((q) => verb(q) === "upsert").flatMap((q) => (call(q, "upsert")![1] as Array<{ recurrence_key: string }>).map((r) => r.recurrence_key));
+
+/** The database taking a job's waiting visits off (remove_recurring_visits): it answers with how many. */
+const removesThem = (fn: string, args: Record<string, any>): Answer => (fn === "remove_recurring_visits" ? { data: args.p_visits.length } : {});
+
+const recurringJob = (id: string, rule: string, startsOn: string) => ({
+  id,
+  company_id: COMPANY,
+  title: "Weekly mowing",
+  property_id: null,
+  starts_on: startsOn,
+  ends_on: null,
+  recurrence_rule: rule,
+  active_months: null,
+  visit_start_time: null,
+  visit_duration_min: 60,
+  default_crew_id: "crew-1",
+  company: { timezone: "UTC" },
+});
+
+afterEach(() => {
+  invites.send = null;
+  invites.calls = [];
+  invites.available = false;
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+describe("a visit's time in a message", () => {
+  it("is the start, or the business's arrival window when it gives one", () => {
+    expect(visitTime("2026-10-20T14:00:00Z", "America/Chicago")).toBe(" at 9:00 AM");
+    expect(visitTime("2026-10-20T14:00:00Z", "America/Chicago", 120)).toBe(" between 9:00 AM and 11:00 AM");
+  });
+});
+
+describe("recurring visits", () => {
+  it("don't come back after someone deletes one", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-10-17T15:00:00Z") });
+    const deleted = "2026-10-19";
+    const { db, queries } = fakeDb((q) => (q.table === "recurrence_skips" ? { data: [{ recurrence_key: deleted }] } : { data: [] }));
+    await materializeJob(db, recurringJob("job-1", "FREQ=DAILY", "2026-10-01"));
+
+    const skips = queries.find((q) => q.table === "recurrence_skips")!;
+    expect(skips.calls).toContainEqual(["eq", "job_id", "job-1"]);
+    const keys = upsertedKeys(queries);
+    expect(keys).toContain("2026-10-18");
+    expect(keys).toContain("2026-10-20");
+    expect(keys).not.toContain(deleted);
+    expect(keys).toHaveLength(VISIT_HORIZON_DAYS); // today and the next year, less the deleted one
+  });
+
+  it("are made a year ahead, a hundred at a time", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-01-10T15:00:00Z") });
+    // The database answers each write with the rows it added.
+    const { db, queries } = fakeDb((q) => (verb(q) === "upsert" ? { data: (call(q, "upsert")![1] as unknown[]).map((_, i) => ({ id: `v-${i}` })) } : { data: [] }));
+    expect(await materializeJob(db, recurringJob("job-1", "FREQ=DAILY", "2026-01-01"))).toEqual({ created: 366, removed: 0, updated: 0 });
+    const writes = queries.filter((q) => verb(q) === "upsert").map((q) => (call(q, "upsert")![1] as unknown[]).length);
+    expect(writes).toEqual([100, 100, 100, 66]);
+    const keys = upsertedKeys(queries);
+    expect([keys[0], keys.at(-1)]).toEqual(["2026-01-10", "2027-01-10"]);
+    expect(new Set(keys).size).toBe(366);
+    // Each write leaves the dates the job already has alone.
+    expect(queries.filter((q) => verb(q) === "upsert").every((q) => (call(q, "upsert")![2] as { ignoreDuplicates: boolean }).ignoreDuplicates)).toBe(true);
+  });
+
+  it("show April's mowing in January: a season's visits are there before it starts, and none out of season", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-01-10T15:00:00Z") });
+    const { db, queries } = fakeDb(() => ({ data: [] }));
+    await materializeJob(db, { ...recurringJob("job-1", "FREQ=WEEKLY;BYDAY=MO", "2025-04-07"), active_months: [4, 5, 6, 7, 8, 9, 10] });
+    const keys = upsertedKeys(queries);
+    expect(keys[0]).toBe("2026-04-06");
+    expect(keys.at(-1)).toBe("2026-10-26");
+    expect(keys.every((k) => Number(k.slice(5, 7)) >= 4 && Number(k.slice(5, 7)) <= 10)).toBe(true);
+    expect(keys).toHaveLength(30);
+  });
+
+  it("stop at the job's last day, however far ahead visits are made", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-01-10T15:00:00Z") });
+    const { db, queries } = fakeDb(() => ({ data: [] }));
+    await materializeJob(db, { ...recurringJob("job-1", "FREQ=WEEKLY;BYDAY=MO", "2026-01-05"), ends_on: "2026-06-30" });
+    const keys = upsertedKeys(queries);
+    expect([keys[0], keys.at(-1)]).toEqual(["2026-01-12", "2026-06-29"]);
+  });
+
+  it("end after a number of visits a year away, counting only the ones in season and not the weeks paused", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-01-10T15:00:00Z") });
+    const { db, queries } = fakeDb(() => ({ data: [] }));
+    // Twenty mowings from the first Monday of April 2026, in season April to October, with two weeks off in July.
+    const job = { ...recurringJob("job-1", "FREQ=WEEKLY;BYDAY=MO;COUNT=20", "2026-04-06"), active_months: [4, 5, 6, 7, 8, 9, 10], pauses: [{ from: "2026-07-06", until: "2026-07-20" }] };
+    await materializeJob(db, job);
+    const keys = upsertedKeys(queries);
+    expect(keys).toHaveLength(20);
+    expect(keys).not.toContain("2026-07-06");
+    expect(keys).not.toContain("2026-07-13");
+    // Apr 6 + 19 weeks is Aug 17; the two weeks off move the last to Aug 31.
+    expect(keys.at(-1)).toBe("2026-08-31");
+    expect(call(queries.find((q) => q.table === "jobs" && verb(q) === "update")!, "update")![1]).toEqual({ ends_on: "2026-08-31" });
+  });
+
+  it("take a year of a paused job's waiting visits off without naming them all in one address", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-01-10T15:00:00Z") });
+    const waiting = Array.from({ length: 250 }, (_, i) => ({ id: `v-${String(i).padStart(3, "0")}`, recurrence_key: addDays("2026-01-10", i) }));
+    const { db, queries, rpcs } = fakeDb(
+      (q) => (q.table === "visits" && verb(q) === "select" ? { data: waiting } : q.table === "time_entries" ? { data: [{ visit_id: "v-120" }] } : { data: [] }),
+      removesThem,
+    );
+    const job = { ...recurringJob("job-1", "FREQ=DAILY", "2026-01-01"), paused_at: "2026-01-09T20:00:00Z", resume_on: null };
+    expect(await materializeJob(db, job)).toEqual({ created: 0, removed: 249, updated: 0 });
+    // The database takes them off in one go (and tells the people on them once); what it's asked
+    // about them first is read a hundred at a time.
+    expect(rpcs).toHaveLength(1);
+    expect(rpcs[0]).toMatchObject({ fn: "remove_recurring_visits", args: { p_job: "job-1" } });
+    expect(rpcs[0]!.args.p_visits).toHaveLength(249);
+    expect(rpcs[0]!.args.p_visits).not.toContain("v-120");
+    expect(queries.some((q) => q.table === "visits" && verb(q) === "delete")).toBe(false);
+    expect(queries.filter((q) => q.table === "time_entries").map((q) => (call(q, "in")![2] as string[]).length)).toEqual([100, 100, 50]);
+  });
+
+  it("create nothing when every upcoming date was deleted", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-10-17T15:00:00Z") });
+    const { db, queries } = fakeDb((q) => (q.table === "recurrence_skips" ? { data: [{ recurrence_key: "2026-10-20" }] } : { data: [] }));
+    expect(await materializeJob(db, { ...recurringJob("job-1", "FREQ=DAILY", "2026-10-20"), ends_on: "2026-10-20" })).toEqual({ created: 0, removed: 0, updated: 0 });
+    expect(queries.some((q) => verb(q) === "upsert")).toBe(false);
+  });
+
+  it("keep a visit that done job pay covers when the schedule drops it, and remove the rest", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-10-17T15:00:00Z") });
+    // A weekly schedule on Mondays now: the Tuesday and Wednesday visits are stale; job pay whose work is done covers the Tuesday's.
+    const { db, queries, rpcs } = fakeDb(
+      (q) =>
+        q.table === "visits" && verb(q) === "select"
+          ? { data: [{ id: "v-tue", recurrence_key: "2026-10-20" }, { id: "v-wed", recurrence_key: "2026-10-21" }] }
+          : q.table === "job_pay_visits" ? { data: [{ visit_id: "v-tue", pay: { status: "done" } }] } : { data: [] },
+      removesThem,
+    );
+    expect(await materializeJob(db, recurringJob("job-1", "FREQ=WEEKLY;BYDAY=MO", "2026-10-19"), true)).toMatchObject({ removed: 1 });
+    const covered = queries.find((q) => q.table === "job_pay_visits")!;
+    expect(covered.calls).toContainEqual(["in", "visit_id", ["v-tue", "v-wed"]]);
+    expect(covered.calls).toContainEqual(["in", "pay.status", ["done", "paid"]]);
+    expect(rpcs).toEqual([{ fn: "remove_recurring_visits", args: { p_job: "job-1", p_visits: ["v-wed"] } }]);
+  });
+
+  it("give the visits already made the job's new title, crew and time only when asked, keeping a moved visit's day", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-10-17T15:00:00Z") });
+    // The database changes the waiting ones in one update (refresh_upcoming_visits, whose test checks
+    // which visits and their times, a moved one's on its own day): here, Monday's moved to Tuesday.
+    const { db, queries, rpcs } = fakeDb(
+      () => ({ data: [] }),
+      (fn) => (fn === "refresh_upcoming_visits" ? { data: 1 } : {}),
+    );
+    const job = { ...recurringJob("job-1", "FREQ=WEEKLY;BYDAY=MO", "2026-10-19"), title: "Mowing", default_crew_id: "crew-2", visit_start_time: "09:00" };
+
+    expect(await materializeJob(db, job, true)).toMatchObject({ updated: 0 });
+    expect(rpcs).toEqual([]);
+
+    expect(await materializeJob(db, job, true, true)).toMatchObject({ updated: 1 });
+    expect(rpcs).toEqual([{ fn: "refresh_upcoming_visits", args: { p_job: "job-1" } }]);
+    expect(queries.some((q) => q.table === "visits" && verb(q) === "update")).toBe(false);
+  });
+
+  it("say so when removing stale visits fails, instead of counting them removed", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-10-17T15:00:00Z") });
+    const { db } = fakeDb(
+      (q) => (q.table === "visits" && verb(q) === "select" ? { data: [{ id: "v-wed", recurrence_key: "2026-10-21" }] } : { data: [] }),
+      (fn) => (fn === "remove_recurring_visits" ? { error: { message: "This pay's work is done, so the visits it covers stay as they are." } } : {}),
+    );
+    await expect(materializeJob(db, recurringJob("job-1", "FREQ=WEEKLY;BYDAY=MO", "2026-10-19"), true)).rejects.toThrow("visits it covers stay");
+  });
+
+  it("make none while the job is paused, and take off the waiting ones that have no work logged", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-10-17T15:00:00Z") });
+    // Both Mondays are still on the schedule; time was logged on the second.
+    const { db, queries, rpcs } = fakeDb(
+      (q) =>
+        q.table === "visits" && verb(q) === "select" ? { data: [{ id: "v-19", recurrence_key: "2026-10-19" }, { id: "v-26", recurrence_key: "2026-10-26" }] }
+          : q.table === "time_entries" ? { data: [{ visit_id: "v-26" }] } : { data: [] },
+      removesThem,
+    );
+    const job = { ...recurringJob("job-1", "FREQ=WEEKLY;BYDAY=MO", "2026-10-19"), paused_at: "2026-10-16T20:00:00Z", resume_on: "2026-11-02" };
+
+    expect(await materializeJob(db, job)).toEqual({ created: 0, removed: 1, updated: 0 });
+    expect(queries.some((q) => verb(q) === "upsert")).toBe(false);
+    expect(rpcs).toEqual([{ fn: "remove_recurring_visits", args: { p_job: "job-1", p_visits: ["v-19"] } }]);
+    for (const table of ["job_pay_visits", "time_entries", "job_materials", "checklist_responses"]) {
+      expect(queries.find((q) => q.table === table)!.calls).toContainEqual(["in", "visit_id", ["v-19", "v-26"]]);
+    }
+    expect(queries.some((q) => q.table === "jobs")).toBe(false);
+  });
+
+  it("resume on the resume date, making visits again from that day", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-10-17T15:00:00Z") });
+    const { db, queries } = fakeDb(() => ({ data: [] }));
+    await materializeJob(db, { ...recurringJob("job-1", "FREQ=WEEKLY;BYDAY=MO", "2026-10-05"), paused_at: "2026-10-01T20:00:00Z", resume_on: "2026-10-17" });
+
+    const resumed = queries.find((q) => q.table === "jobs" && verb(q) === "update")!;
+    expect(call(resumed, "update")![1]).toEqual({ paused_at: null });
+    expect(resumed.calls).toContainEqual(["eq", "id", "job-1"]);
+    const upsert = queries.find((q) => verb(q) === "upsert")!;
+    expect((call(upsert, "upsert")![1] as Array<{ recurrence_key: string }>).map((r) => r.recurrence_key).slice(0, 2)).toEqual(["2026-10-19", "2026-10-26"]);
+  });
+
+  it("end after a number of visits counted from the first date, keeping the job's end at the last", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-10-17T15:00:00Z") });
+    const { db, queries } = fakeDb(() => ({ data: [] }));
+    // Four Mondays from Oct 5: two are done already, so Oct 19 and 26 are left.
+    await materializeJob(db, recurringJob("job-1", "FREQ=WEEKLY;BYDAY=MO;COUNT=4", "2026-10-05"));
+
+    const upsert = queries.find((q) => verb(q) === "upsert")!;
+    expect((call(upsert, "upsert")![1] as Array<{ recurrence_key: string }>).map((r) => r.recurrence_key)).toEqual(["2026-10-19", "2026-10-26"]);
+    const ends = queries.find((q) => q.table === "jobs" && verb(q) === "update")!;
+    expect(call(ends, "update")![1]).toEqual({ ends_on: "2026-10-26" });
+  });
+
+  it("don't count the days a job was paused toward the visits it ends after", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-10-17T15:00:00Z") });
+    const { db, queries } = fakeDb(() => ({ data: [] }));
+    // Four Mondays from Oct 5, paused the week of Oct 12: Oct 5, 19, 26 and Nov 2.
+    await materializeJob(db, { ...recurringJob("job-1", "FREQ=WEEKLY;BYDAY=MO;COUNT=4", "2026-10-05"), pauses: [{ from: "2026-10-12", until: "2026-10-19" }] });
+
+    const upsert = queries.find((q) => verb(q) === "upsert")!;
+    expect((call(upsert, "upsert")![1] as Array<{ recurrence_key: string }>).map((r) => r.recurrence_key)).toEqual(["2026-10-19", "2026-10-26", "2026-11-02"]);
+    expect(call(queries.find((q) => q.table === "jobs" && verb(q) === "update")!, "update")![1]).toEqual({ ends_on: "2026-11-02" });
+  });
+
+  it("count a job still paused as back on its resume date, and one resuming by the stretch the database kept", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-10-17T15:00:00Z") });
+    const job = { ...recurringJob("job-1", "FREQ=WEEKLY;BYDAY=MO;COUNT=4", "2026-10-05"), ends_on: "2026-10-26" };
+    let { db, queries } = fakeDb(() => ({ data: [] }));
+    // Paused on Oct 10 until Oct 27: Oct 12, 19 and 26 don't count.
+    await materializeJob(db, { ...job, paused_at: "2026-10-10T15:00:00Z", resume_on: "2026-10-27" });
+    expect(call(queries.find((q) => q.table === "jobs" && verb(q) === "update")!, "update")![1]).toEqual({ ends_on: "2026-11-16" });
+    expect(queries.some((q) => verb(q) === "upsert")).toBe(false);
+
+    // Resumed on Oct 17 by the nightly run: the database kept Oct 10 to 17.
+    ({ db, queries } = fakeDb((q) => (q.table === "jobs" ? { data: { pauses: [{ from: "2026-10-10", until: "2026-10-17" }] } } : { data: [] })));
+    await materializeJob(db, { ...job, paused_at: "2026-10-10T15:00:00Z", resume_on: "2026-10-17" });
+    const updates = queries.filter((q) => q.table === "jobs" && verb(q) === "update").map((q) => call(q, "update")![1]);
+    expect(updates).toEqual([{ paused_at: null }, { ends_on: "2026-11-02" }]);
+    const upsert = queries.find((q) => verb(q) === "upsert")!;
+    expect((call(upsert, "upsert")![1] as Array<{ recurrence_key: string }>).map((r) => r.recurrence_key)).toEqual(["2026-10-19", "2026-10-26", "2026-11-02"]);
+  });
+});
+
+describe("lists past 1,000 rows", () => {
+  it("schedule every recurring job, not just the first 1,000", async () => {
+    const jobs = Array.from({ length: 2500 }, (_, i) => recurringJob(`job-${String(i).padStart(4, "0")}`, "FREQ=WEEKLY", addDays("2026-10-01", i % 7)));
+    const { queries } = fakeDb((q) => (q.table === "jobs" ? upTo1000(jobs, q) : { data: [] }));
+    const result = await runTask("recurrence", env);
+
+    expect(result).toMatchObject({ jobs: 2500, problems: [] });
+    const scheduled = new Set(queries.filter((q) => verb(q) === "upsert").map((q) => (call(q, "upsert")![1] as Array<{ job_id: string }>)[0]!.job_id));
+    expect(scheduled.size).toBe(2500);
+    for (const q of queries.filter((q) => q.table === "jobs")) expect(q.calls).toContainEqual(["order", "id"]);
+  });
+
+  it("show a busy month's whole schedule", async () => {
+    const visits = Array.from({ length: 1500 }, (_, i) => ({ id: `visit-${String(i).padStart(4, "0")}`, scheduled_on: addDays("2026-11-01", i % 42) }));
+    const { queries } = fakeDb((q) => {
+      if (q.table === "memberships") return { data: { role: "office", role_id: null } };
+      if (q.table === "visits" && call(q, "gte")) return upTo1000(visits, q);
+      return { data: [] };
+    });
+    const res = await app.request("/api/schedule?from=2026-11-01&to=2026-12-12", { headers: { Authorization: "Bearer token", "X-Company-Id": COMPANY } }, env);
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { visits: Array<{ id: string }> };
+    expect(body.visits.map((v) => v.id)).toEqual(visits.map((v) => v.id));
+    const pages = queries.filter((q) => q.table === "visits" && call(q, "gte"));
+    expect(pages.map((q) => call(q, "range")!.slice(1))).toEqual([[0, 999], [1000, 1999]]);
+    for (const q of pages) expect(q.calls.at(-2)).toEqual(["order", "id"]); // ties broken the same way on every page
+  });
+});
+
+describe("accounting sync", () => {
+  const expiring = () => encryptJson(env, { access_token: "old", refresh_token: "refresh-1", expires_at: Date.now() + 60_000 });
+  const integrationWrites = (queries: Query[]) => queries.filter((q) => q.table === "integrations" && verb(q) === "update").map((q) => call(q, "update")![1]);
+
+  it.each([
+    ["an outage", () => Response.json({ error: "temporarily_unavailable" }, { status: 503 })],
+    ["a timeout", () => Promise.reject(new TypeError("fetch failed"))],
+  ])("keeps the app connected when refreshing its sign-in hits %s", async (_, response) => {
+    const ciphertext = await expiring();
+    const { db, queries } = fakeDb((q) => (q.table === "integration_secrets" ? { data: { ciphertext } } : {}));
+    vi.stubGlobal("fetch", async () => response());
+    await expect(accessToken(env, db, COMPANY, "quickbooks")).rejects.toThrow();
+    expect(integrationWrites(queries)).toEqual([]);
+  });
+
+  it.each([
+    ["quickbooks", 400, "invalid_grant"],
+    ["zoho_books", 200, "invalid_code"], // Zoho refuses with a 200
+  ] as const)("asks for a reconnect when %s refuses the sign-in", async (provider, status, error) => {
+    const ciphertext = await expiring();
+    const { db, queries } = fakeDb((q) => (q.table === "integration_secrets" ? { data: { ciphertext } } : {}));
+    vi.stubGlobal("fetch", async () => Response.json({ error }, { status }));
+    await expect(accessToken(env, db, COMPANY, provider)).rejects.toThrow(error);
+    expect(integrationWrites(queries)).toEqual([{ status: "error", last_error: "Sign-in expired. Reconnect on the Apps page." }]);
+  });
+
+  // QuickBooks changes the refresh token as it goes, and stops taking the one before.
+  describe("refreshing a sign-in that's about to run out", () => {
+    /** The stored tokens, kept as the app keeps them: read on a select, replaced on an upsert. */
+    async function stored() {
+      const kept = { ciphertext: await expiring() };
+      const { db, queries } = fakeDb((q) => {
+        if (q.table !== "integration_secrets") return {};
+        if (verb(q) === "upsert") kept.ciphertext = call(q, "upsert")![1].ciphertext;
+        return { data: { ciphertext: kept.ciphertext } };
+      });
+      return { db, queries, kept, now: () => decryptJson<{ access_token: string; refresh_token: string }>(env, kept.ciphertext) };
+    }
+    /** Intuit's token endpoint: each refresh token works once, and gets the next one back. */
+    function intuit() {
+      const used: string[] = [];
+      vi.stubGlobal("fetch", async (_url: string, init: RequestInit) => {
+        const token = (init.body as URLSearchParams).get("refresh_token")!;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        if (used.includes(token)) return Response.json({ error: "invalid_grant" }, { status: 400 });
+        used.push(token);
+        return Response.json({ access_token: `access-${used.length + 1}`, refresh_token: `refresh-${used.length + 1}`, expires_in: 3600 });
+      });
+      return used;
+    }
+
+    it("refreshes once when two things need it at the same moment", async () => {
+      const { db, queries, now } = await stored();
+      const used = intuit();
+      const both = await Promise.all([accessToken(env, db, COMPANY, "quickbooks"), accessToken(env, db, COMPANY, "quickbooks")]);
+      expect(both.map((b) => b.token)).toEqual(["access-2", "access-2"]);
+      expect(used).toEqual(["refresh-1"]);
+      expect(await now()).toMatchObject({ access_token: "access-2", refresh_token: "refresh-2" });
+      expect(integrationWrites(queries)).toEqual([]);
+    });
+
+    it("refreshes again the next time it's needed", async () => {
+      const { db, kept } = await stored();
+      const used = intuit();
+      await accessToken(env, db, COMPANY, "quickbooks");
+      kept.ciphertext = await encryptJson(env, { access_token: "access-2", refresh_token: "refresh-2", expires_at: Date.now() + 60_000 });
+      expect((await accessToken(env, db, COMPANY, "quickbooks")).token).toBe("access-3");
+      expect(used).toEqual(["refresh-1", "refresh-2"]);
+    });
+
+    it("uses the tokens another server just saved when its own refresh is refused", async () => {
+      const { db, queries, kept } = await stored();
+      vi.stubGlobal("fetch", async () => {
+        // The other server got there first: Intuit took refresh-1 from it, and its tokens are saved.
+        kept.ciphertext = await encryptJson(env, { access_token: "theirs", refresh_token: "refresh-2", expires_at: Date.now() + 3_600_000 });
+        return Response.json({ error: "invalid_grant" }, { status: 400 });
+      });
+      expect(await accessToken(env, db, COMPANY, "quickbooks")).toMatchObject({ token: "theirs", secret: { refresh_token: "refresh-2" } });
+      expect(integrationWrites(queries)).toEqual([]);
+    });
+
+    it("never gives one company, or one app, another's refresh", async () => {
+      const { db } = await stored();
+      let asked = 0;
+      vi.stubGlobal("fetch", async () => Response.json({ access_token: `access-${++asked}`, expires_in: 3600 }));
+      const tokens = await Promise.all([
+        accessToken(env, db, COMPANY, "quickbooks"),
+        accessToken(env, db, "00000000-0000-4000-8000-000000000002", "quickbooks"),
+        accessToken(env, db, COMPANY, "zoho_books"),
+      ]);
+      expect(new Set(tokens.map((t) => t.token)).size).toBe(3);
+    });
+  });
+
+  // After its eight tries the task leaves a change be, and so it stayed, even once the owner had
+  // fixed what was wrong.
+  describe("changes the task gave up on", () => {
+    const headers = { Authorization: "Bearer token", "X-Company-Id": COMPANY, "Content-Type": "application/json" };
+    /** Our side: the member asking, QuickBooks' row as given, and how many changes the database queues again. */
+    const ours = (row: Record<string, unknown> | null, waiting = 2) =>
+      fakeDb(
+        (q) => {
+          if (q.table === "memberships") return { data: { role: "owner", role_id: null } };
+          if (q.table === "integrations" && verb(q) === "select") return { data: row };
+          return { data: null };
+        },
+        (fn) => (fn === "requeue_accounting" ? { data: waiting } : {}),
+      );
+    const again = (rpcs: Array<{ fn: string; args: Record<string, any> }>) => rpcs.filter((r) => r.fn === "requeue_accounting").map((r) => r.args);
+
+    it("go again when the owner connects the same books again", async () => {
+      const { rpcs, queries } = ours(null);
+      vi.stubGlobal("fetch", async (url: string) =>
+        url.includes("/oauth2/v1/tokens/bearer") ? Response.json({ access_token: "access-1", refresh_token: "refresh-1", expires_in: 3600 }) : Response.json({ CompanyInfo: { CompanyName: "Meadows Exteriors" } }),
+      );
+      const state = await signToken(env, { company: COMPANY, user: "user-1", provider: "quickbooks", nonce: "nonce-1", exp: Math.floor(Date.now() / 1000) + 600 });
+      const res = await app.request(`/api/apps/quickbooks/callback?${new URLSearchParams({ state, code: "code-1", realmId: "realm-1" })}`, { headers: { Cookie: "jobly_oauth_nonce=nonce-1" } }, env);
+      expect(res.headers.get("location")).toContain("/apps/quickbooks?status=connected");
+      expect(again(rpcs)).toEqual([{ p_company: COMPANY, p_provider: "quickbooks", p_account: "realm-1" }]);
+      // Only once the sign-in is saved: before that they'd fail again.
+      expect(queries.some((q) => q.table === "integration_secrets" && verb(q) === "upsert")).toBe(true);
+    });
+
+    it("go again when the owner asks, and the note about them goes", async () => {
+      const { rpcs, queries } = ours({ status: "connected", external_account_id: "realm-1" });
+      const res = await app.request("/api/apps/quickbooks/retry", { method: "POST", headers }, env);
+      expect(await res.json()).toEqual({ queued: 2 });
+      expect(again(rpcs)).toEqual([{ p_company: COMPANY, p_provider: "quickbooks", p_account: "realm-1" }]);
+      expect(integrationWrites(queries)).toEqual([{ last_error: null }]);
+    });
+
+    it("keep the note when there was nothing to try again", async () => {
+      const { queries } = ours({ status: "connected", external_account_id: "realm-1" }, 0);
+      const res = await app.request("/api/apps/quickbooks/retry", { method: "POST", headers }, env);
+      expect(await res.json()).toEqual({ queued: 0 });
+      expect(integrationWrites(queries)).toEqual([]);
+    });
+
+    it.each([
+      ["quickbooks", { status: "error", external_account_id: "realm-1" }, 409],
+      ["zoho_books", null, 409],
+      ["stripe", { status: "connected", external_account_id: "acct_1" }, 400],
+    ] as const)("aren't tried for %s while it isn't the connected books", async (provider, row, status) => {
+      const { rpcs } = ours(row);
+      const res = await app.request(`/api/apps/${provider}/retry`, { method: "POST", headers }, env);
+      expect(res.status).toBe(status);
+      expect(again(rpcs)).toEqual([]);
+    });
+  });
+
+  it("retries changes queued while the app isn't connected instead of dropping them", async () => {
+    const row = { id: 7, company_id: COMPANY, topic: "accounting.invoice", payload: { invoice_id: "inv-1" }, attempts: 1 };
+    const { queries } = fakeDb(
+      () => ({ data: null }),
+      (fn) => (fn === "claim_outbox" ? { data: [row] } : {}),
+    );
+    expect(await runTask("outbox", env)).toEqual({ claimed: 1, done: 0, failed: 1 });
+    const update = call(queries.find((q) => q.table === "outbox")!, "update")![1];
+    expect(update).not.toHaveProperty("done_at");
+    expect(update).toMatchObject({ last_error: expect.stringContaining("isn't connected"), dead_at: null });
+  });
+
+  it("keeps the app connected when one record never goes through", async () => {
+    const row = { id: 8, company_id: COMPANY, topic: "accounting.invoice", payload: { invoice_id: "inv-gone" }, attempts: 8 };
+    const { queries } = fakeDb(
+      (q) => (q.table === "integrations" && verb(q) === "select" ? { data: { provider: "quickbooks", external_account_id: "realm-1", settings: {} } } : { data: null }),
+      (fn) => (fn === "claim_outbox" ? { data: [row] } : {}),
+    );
+    expect(await runTask("outbox", env)).toEqual({ claimed: 1, done: 0, failed: 1 });
+    expect(call(queries.find((q) => q.table === "outbox")!, "update")![1].dead_at).toEqual(expect.any(String));
+    const marked = queries.find((q) => q.table === "integrations" && verb(q) === "update")!;
+    expect(call(marked, "update")![1]).toEqual({ last_error: "Invoice not found" });
+    expect(marked.calls).toContainEqual(["eq", "status", "connected"]);
+  });
+
+  it("keeps that note after the next record syncs", async () => {
+    const rows = [
+      { id: 8, company_id: COMPANY, topic: "accounting.invoice", payload: { invoice_id: "inv-gone" }, attempts: 8 },
+      { id: 9, company_id: COMPANY, topic: "accounting.payment", payload: { payment_id: "refund-1" }, attempts: 1 },
+    ];
+    const { queries } = fakeDb(
+      (q) => {
+        if (q.table === "integrations" && verb(q) === "select") return { data: { provider: "quickbooks", external_account_id: "realm-1", settings: {} } };
+        // A refund goes through without calling QuickBooks (they're entered by hand for now).
+        if (q.table === "payments") return { data: { id: "refund-1", client_id: "client-1", invoice_id: null, amount: -20, method: "card", received_at: "2026-10-17T15:00:00Z" } };
+        return { data: null };
+      },
+      (fn) => (fn === "claim_outbox" ? { data: rows } : {}),
+    );
+    expect(await runTask("outbox", env)).toEqual({ claimed: 2, done: 1, failed: 1 });
+    expect(integrationWrites(queries)).toEqual([{ last_error: "Invoice not found" }, { last_sync_at: expect.any(String), status: "connected" }]);
+  });
+
+  it.each(["quickbooks", "zoho_books"])("sends %s nothing for a payment that was only a tip", async (provider) => {
+    // The client's credit in Stripe paid the invoice, and Stripe charged only the tip. Tips aren't
+    // sent (they aren't on the invoice in the books), and a payment of nothing is refused there.
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    const { db, queries } = fakeDb((q) => {
+      if (q.table === "integrations" && verb(q) === "select") return { data: { provider, external_account_id: "books-1", settings: {} } };
+      if (q.table === "payments") return { data: { id: "tip-1", client_id: "client-1", invoice_id: "inv-1", amount: 0, tip_amount: 15, method: "card", received_at: "2026-10-17T15:00:00Z" } };
+      return { data: null };
+    });
+    await runAccountingJob(env, db, { company_id: COMPANY, topic: "accounting.payment", payload: { payment_id: "tip-1" } });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(queries.filter((q) => q.table === "sync_links" && verb(q) === "upsert")).toEqual([]);
+    expect(integrationWrites(queries)).toEqual([{ last_sync_at: expect.any(String), status: "connected" }]);
+  });
+
+  describe("sending an invoice", () => {
+    const connected = { provider: "quickbooks", external_account_id: "realm-1", settings: {} };
+    const invoice = {
+      id: "inv-1", number: 1042, client_id: "client-1", issued_on: "2026-10-17", due_on: null, subject: null, tax_rate: 0, tax_amount: 0, discount_amount: 0,
+      invoice_line_items: [{ name: "Mowing", description: null, quantity: 1, unit_price: 45, taxable: false, service_id: null, sort: 0 }],
+    };
+    const answers = (ciphertext: string, links: (entity: string) => Answer, saveLink: () => Answer) => (q: Query): Answer => {
+      if (q.table === "integrations") return verb(q) === "select" ? { data: connected } : {};
+      if (q.table === "integration_secrets") return { data: { ciphertext } };
+      if (q.table === "invoices") return { data: invoice };
+      if (q.table === "sync_links") return verb(q) === "upsert" ? saveLink() : links(call(q, "match")![1].entity);
+      return { data: null };
+    };
+    const clientLinked = (entity: string): Answer => ({ data: entity === "client" ? { external_id: "cust-1" } : null });
+    const quickbooksTakesIt = () => {
+      const sent: string[] = [];
+      vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+        if (init?.method !== "POST") return Response.json({ QueryResponse: {} }); // not sent before
+        sent.push(url);
+        return Response.json({ Invoice: { Id: "qbo-77", SyncToken: "0" } });
+      });
+      return sent;
+    };
+    const saves = (queries: Query[]) => queries.filter((q) => q.table === "sync_links" && verb(q) === "upsert").length;
+
+    it("fails for good when QuickBooks took it but the link couldn't be saved", async () => {
+      const ciphertext = await encryptJson(env, { access_token: "token", refresh_token: "refresh-1", expires_at: Date.now() + 3_600_000 });
+      const sent = quickbooksTakesIt();
+      const { db, queries } = fakeDb(answers(ciphertext, clientLinked, () => ({ error: { message: "connection reset" } })));
+      const job = runAccountingJob(env, db, { company_id: COMPANY, topic: "accounting.invoice", payload: { invoice_id: "inv-1" } });
+      await expect(job).rejects.toThrow("Sent invoice qbo-77 but couldn't record it: connection reset");
+      await expect(job).rejects.toBeInstanceOf(SentButUnrecorded);
+      expect(sent).toHaveLength(1);
+      expect(saves(queries)).toBe(2); // tried once more first
+    });
+
+    it("saves the link on a second try rather than sending the invoice again", async () => {
+      const ciphertext = await encryptJson(env, { access_token: "token", expires_at: Date.now() + 3_600_000 });
+      const sent = quickbooksTakesIt();
+      let tries = 0;
+      const { db, queries } = fakeDb(answers(ciphertext, clientLinked, () => (++tries === 1 ? { error: { message: "connection reset" } } : {})));
+      await runAccountingJob(env, db, { company_id: COMPANY, topic: "accounting.invoice", payload: { invoice_id: "inv-1" } });
+      expect(sent).toHaveLength(1);
+      expect(saves(queries)).toBe(2);
+    });
+
+    it("isn't retried once QuickBooks took it, so the books don't get a copy", async () => {
+      const ciphertext = await encryptJson(env, { access_token: "token", expires_at: Date.now() + 3_600_000 });
+      const sent = quickbooksTakesIt();
+      const row = { id: 10, company_id: COMPANY, topic: "accounting.invoice", payload: { invoice_id: "inv-1" }, attempts: 1 };
+      const { queries } = fakeDb(
+        answers(ciphertext, clientLinked, () => ({ error: { message: "connection reset" } })),
+        (fn) => (fn === "claim_outbox" ? { data: [row] } : {}),
+      );
+      expect(await runTask("outbox", env)).toEqual({ claimed: 1, done: 0, failed: 1 });
+      expect(sent).toHaveLength(1);
+      expect(call(queries.find((q) => q.table === "outbox")!, "update")![1]).toMatchObject({ dead_at: expect.any(String), last_error: expect.stringContaining("Sent invoice qbo-77") });
+      expect(integrationWrites(queries)).toEqual([{ last_error: "Sent invoice qbo-77 but couldn't record it: connection reset" }]);
+    });
+
+    it("doesn't send it when it can't tell whether it was sent already", async () => {
+      const ciphertext = await encryptJson(env, { access_token: "token", expires_at: Date.now() + 3_600_000 });
+      const fetch = vi.fn();
+      vi.stubGlobal("fetch", fetch);
+      const { db } = fakeDb(answers(ciphertext, () => ({ error: { message: "connection reset" } }), () => ({})));
+      await expect(runAccountingJob(env, db, { company_id: COMPANY, topic: "accounting.invoice", payload: { invoice_id: "inv-1" } })).rejects.toThrow("connection reset");
+      expect(fetch).not.toHaveBeenCalled();
+    });
+  });
+
+  // The provider can finish a create after we stopped waiting for it (providerTimeout), and the
+  // outbox then runs the job again.
+  describe("a create that goes through after we stop waiting", () => {
+    const invoice = {
+      id: "inv-1", number: 1042, client_id: "client-1", issued_on: "2026-10-17", due_on: null, subject: null, tax_rate: 0, tax_amount: 0, discount_amount: 0,
+      invoice_line_items: [{ name: "Mowing", description: null, quantity: 1, unit_price: 45, taxable: false, service_id: null, sort: 0 }],
+    };
+    const payment = { id: "pay-1", client_id: "client-1", invoice_id: "inv-1", amount: 45, method: "card", received_at: "2026-10-17T15:00:00Z" };
+    const invoiceJob = { company_id: COMPANY, topic: "accounting.invoice", payload: { invoice_id: "inv-1" } };
+    const paymentJob = { company_id: COMPANY, topic: "accounting.payment", payload: { payment_id: "pay-1" } };
+
+    /**
+     * Our side: the client (and maybe the invoice) sent before, and the links saved since. `others`
+     * are other records' links, which the provider's id finds.
+     */
+    async function ours(provider: "quickbooks" | "zoho_books", linked: Record<string, string>, others: Array<{ entity: string; local_id: string; external_id: string }> = [], sent: Record<string, unknown> = invoice) {
+      const ciphertext = await encryptJson(env, { access_token: "token", expires_at: Date.now() + 3_600_000 });
+      const links = new Map(Object.entries(linked));
+      const { db } = fakeDb((q) => {
+        if (q.table === "integrations") return verb(q) === "select" ? { data: { provider, external_account_id: "books-1", settings: {} } } : {};
+        if (q.table === "integration_secrets") return { data: { ciphertext } };
+        if (q.table === "invoices") return { data: sent };
+        if (q.table === "payments") return { data: payment };
+        if (q.table === "sync_links") {
+          if (verb(q) === "upsert") links.set(call(q, "upsert")![1].entity, call(q, "upsert")![1].external_id);
+          const match = call(q, "match")?.[1];
+          if (match?.external_id) return { data: others.filter((l) => l.entity === match.entity && l.external_id === match.external_id) };
+          const id = links.get(match?.entity);
+          return { data: id ? { external_id: id } : null };
+        }
+        return { data: null };
+      });
+      return { db, links };
+    }
+
+    /**
+     * The provider: it makes every record it's sent and finds them the way its API does. The first
+     * create it answers only after we've stopped waiting (first: "late", the default), or turns
+     * down ("refused"), or answers as usual ("answered"). With requestIds it answers a repeated
+     * request id with whatever it answered first, a refusal included (QuickBooks doesn't say it won't).
+     */
+    function provider(options: {
+      find: (url: URL, made: Array<Record<string, any>>) => unknown;
+      answer: (record: Record<string, any>) => unknown;
+      first?: "late" | "refused" | "answered";
+      requestIds?: boolean;
+      made?: Array<Record<string, any>>;
+    }) {
+      const made = options.made ?? [];
+      const posts: URL[] = [];
+      const answered = new Map<string, () => Response>();
+      vi.stubGlobal("fetch", async (input: string, init?: RequestInit) => {
+        const url = new URL(input);
+        if (init?.method !== "POST") return Response.json(options.find(url, made));
+        posts.push(url);
+        const requestId = url.searchParams.get("requestid");
+        if (options.requestIds && requestId && answered.has(requestId)) return answered.get(requestId)!();
+        const first = posts.length === 1 ? (options.first ?? "late") : "answered";
+        let reply: () => Response;
+        if (first === "refused") {
+          reply = () => Response.json({ Fault: { Error: [{ Message: "The transaction date is in a closed period" }] } }, { status: 400 });
+        } else {
+          const record = { ...JSON.parse(String(init.body)), kind: url.pathname.split("/").at(-1), id: `made-${made.length + 1}` };
+          made.push(record);
+          reply = () => Response.json(options.answer(record));
+        }
+        if (requestId) answered.set(requestId, reply);
+        if (first === "late") throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+        return reply();
+      });
+      return { made, posts };
+    }
+
+    type Options = { first?: "late" | "refused" | "answered"; requestIds?: boolean; made?: Array<Record<string, any>> };
+
+    const quickbooks = (options: Options = {}) =>
+      provider({
+        ...options,
+        // query?query=select * from Invoice where DocNumber = '1042'
+        // query?query=select * from Payment where CustomerRef = 'cust-1' and TxnDate = '2026-10-17'
+        find: (url, made) => {
+          const query = url.searchParams.get("query") ?? "";
+          const value = (field: string) => new RegExp(`${field} = '([^']*)'`).exec(query)?.[1];
+          const [entity, found] = query.includes("from Invoice")
+            ? ["Invoice", made.filter((r) => r.kind === "invoice" && r.DocNumber === value("DocNumber"))]
+            : ["Payment", made.filter((r) => r.kind === "payment" && r.CustomerRef?.value === value("CustomerRef") && r.TxnDate === value("TxnDate"))];
+          return { QueryResponse: { [entity as string]: (found as Array<Record<string, any>>).map((r) => ({ ...r, Id: r.id, SyncToken: "0" })) } };
+        },
+        answer: (r) => ({ [r.kind === "invoice" ? "Invoice" : "Payment"]: { Id: r.id, SyncToken: "0" } }),
+      });
+
+    const zoho = (options: Options = {}) =>
+      provider({
+        ...options,
+        // invoices?reference_number=...&customer_id=... and customerpayments?reference_number=...
+        find: (url, made) => {
+          const kind = url.pathname.split("/").at(-1);
+          const hits = made.filter((r) => r.kind === kind && r.reference_number === url.searchParams.get("reference_number"));
+          // Zoho works out an invoice's total; nothing of ours sends it tax.
+          const total = (r: Record<string, any>) => r.total ?? r.line_items.reduce((sum: number, l: any) => sum + l.rate * l.quantity, 0) - (r.discount ?? 0);
+          return kind === "invoices"
+            ? { code: 0, invoices: hits.filter((r) => r.customer_id === url.searchParams.get("customer_id")).map((r) => ({ ...r, invoice_id: r.id, total: total(r) })) }
+            : { code: 0, customerpayments: hits.map((r) => ({ ...r, payment_id: r.id })) };
+        },
+        answer: (r) => (r.kind === "invoices" ? { code: 0, invoice: { invoice_id: r.id } } : { code: 0, payment: { payment_id: r.id } }),
+      });
+
+    it("doesn't put a second invoice in QuickBooks", async () => {
+      const { db, links } = await ours("quickbooks", { client: "cust-1" });
+      const qbo = quickbooks();
+      await expect(runAccountingJob(env, db, invoiceJob)).rejects.toThrow("timeout");
+      await runAccountingJob(env, db, invoiceJob); // the outbox's retry
+      expect(qbo.made).toHaveLength(1);
+      expect(qbo.posts).toHaveLength(1); // found by its number instead
+      expect(links.get("invoice")).toBe("made-1");
+    });
+
+    // Our numbers start at 1 and the customer may already be in QuickBooks (found by name), with
+    // invoices of its own, or ones from an earlier Jobly company.
+    it("doesn't take an invoice of theirs with our number for ours", async () => {
+      const { db, links } = await ours("quickbooks", { client: "cust-1" });
+      const line = (amount: number) => [{ DetailType: "SalesItemLineDetail", Amount: amount }];
+      const qbo = quickbooks({
+        first: "answered",
+        made: [
+          { kind: "invoice", id: "old-2019", DocNumber: "1042", CustomerRef: { value: "cust-1" }, TxnDate: "2019-03-02", Line: line(45), TotalAmt: 45 },
+          { kind: "invoice", id: "same-day", DocNumber: "1042", CustomerRef: { value: "cust-1" }, TxnDate: "2026-10-17", Line: line(990), TotalAmt: 990 },
+        ],
+      });
+      await runAccountingJob(env, db, invoiceJob);
+      expect(qbo.posts).toHaveLength(1);
+      expect(links.get("invoice")).toBe("made-3");
+    });
+
+    // QuickBooks says a repeated request id gets "the same response" as the first; if that's a
+    // refusal, the invoice could never go through once its cause (here a closed period) is fixed.
+    it("sends an invoice QuickBooks turned down again as a new request", async () => {
+      const { db, links } = await ours("quickbooks", { client: "cust-1" });
+      const qbo = quickbooks({ first: "refused", requestIds: true });
+      await expect(runAccountingJob(env, db, invoiceJob)).rejects.toThrow("closed period");
+      await runAccountingJob(env, db, invoiceJob); // after someone reopened the period
+      expect(qbo.made).toHaveLength(1);
+      expect(links.get("invoice")).toBe("made-1");
+      expect(qbo.posts.map((url) => url.searchParams.get("requestid"))).toEqual([null, null]);
+    });
+
+    it("still sends an invoice when the one in QuickBooks with that number is another customer's", async () => {
+      const { db, links } = await ours("quickbooks", { client: "cust-1" });
+      const qbo = quickbooks({ made: [{ kind: "invoice", id: "theirs", DocNumber: "1042", CustomerRef: { value: "cust-9" } }] });
+      await expect(runAccountingJob(env, db, invoiceJob)).rejects.toThrow("timeout");
+      await runAccountingJob(env, db, invoiceJob);
+      expect(qbo.made.map((r) => r.id)).toEqual(["theirs", "made-2"]);
+      expect(links.get("invoice")).toBe("made-2");
+    });
+
+    it("doesn't put a second payment in QuickBooks", async () => {
+      const { db, links } = await ours("quickbooks", { client: "cust-1", invoice: "qbo-inv-1" });
+      const qbo = quickbooks();
+      await expect(runAccountingJob(env, db, paymentJob)).rejects.toThrow("timeout");
+      await runAccountingJob(env, db, paymentJob);
+      expect(qbo.made).toMatchObject([{ TotalAmt: 45, TxnDate: "2026-10-17", Line: [{ LinkedTxn: [{ TxnId: "qbo-inv-1" }] }] }]);
+      expect(qbo.posts).toHaveLength(1); // found from the customer, day, amount and invoice instead
+      expect(links.get("payment")).toBe("made-1");
+    });
+
+    it("sends a payment like one QuickBooks has that day when that one's another of ours, or another amount", async () => {
+      const { db, links } = await ours("quickbooks", { client: "cust-1", invoice: "qbo-inv-1" }, [{ entity: "payment", local_id: "pay-0", external_id: "made-1" }]);
+      const paid = (id: string, amount: number) => ({
+        kind: "payment", id, CustomerRef: { value: "cust-1" }, TotalAmt: amount, TxnDate: "2026-10-17", Line: [{ Amount: amount, LinkedTxn: [{ TxnId: "qbo-inv-1", TxnType: "Invoice" }] }],
+      });
+      const qbo = quickbooks({ first: "answered", made: [paid("made-1", 45), paid("made-2", 20)] });
+      await runAccountingJob(env, db, paymentJob);
+      expect(qbo.posts).toHaveLength(1);
+      expect(links.get("payment")).toBe("made-3");
+    });
+
+    it("doesn't put a second invoice in Zoho Books", async () => {
+      const { db, links } = await ours("zoho_books", { client: "contact-1" });
+      const books = zoho();
+      await expect(runAccountingJob(env, db, invoiceJob)).rejects.toThrow("timeout");
+      await runAccountingJob(env, db, invoiceJob);
+      expect(books.made).toHaveLength(1);
+      expect(books.posts).toHaveLength(1);
+      expect(links.get("invoice")).toBe("made-1");
+    });
+
+    it("doesn't take a Zoho invoice of theirs with our number as its reference for ours", async () => {
+      const { db, links } = await ours("zoho_books", { client: "contact-1" });
+      const books = zoho({
+        first: "answered",
+        made: [
+          { kind: "invoices", id: "old-2019", reference_number: "1042", customer_id: "contact-1", date: "2019-03-02", total: 45 },
+          { kind: "invoices", id: "same-day", reference_number: "1042", customer_id: "contact-1", date: "2026-10-17", total: 990 },
+        ],
+      });
+      await runAccountingJob(env, db, invoiceJob);
+      expect(books.posts).toHaveLength(1);
+      expect(links.get("invoice")).toBe("made-3");
+    });
+
+    // $200 of mowing, a $20 promo and $50 of referral credits: the books get one $70 discount before tax.
+    const credited = { ...invoice, discount_amount: 20, credit_amount: 50, invoice_line_items: [{ ...invoice.invoice_line_items[0]!, unit_price: 200 }] };
+
+    it("sends QuickBooks referral credits in its one discount line, before tax", async () => {
+      const { db } = await ours("quickbooks", { client: "cust-1" }, [], credited);
+      const qbo = quickbooks({ first: "answered" });
+      await runAccountingJob(env, db, invoiceJob);
+      expect(qbo.made).toHaveLength(1);
+      expect(qbo.made[0]!.Line).toEqual(expect.arrayContaining([{ DetailType: "DiscountLineDetail", Amount: 70, DiscountLineDetail: { PercentBased: false } }]));
+      expect(qbo.made[0]!.Line.filter((l: { DetailType: string }) => l.DetailType === "DiscountLineDetail")).toHaveLength(1);
+      expect(qbo.made[0]!.ApplyTaxAfterDiscount).toBe(true);
+    });
+
+    it("sends Zoho Books referral credits in its discount, and finds the one it sent by its total less them", async () => {
+      const { db, links } = await ours("zoho_books", { client: "contact-1" }, [], credited);
+      const books = zoho();
+      await expect(runAccountingJob(env, db, invoiceJob)).rejects.toThrow("timeout");
+      await runAccountingJob(env, db, invoiceJob); // the outbox's retry finds the $130 invoice it sent
+      expect(books.made).toMatchObject([{ discount: 70, discount_type: "entity_level", is_discount_before_tax: true }]);
+      expect(books.posts).toHaveLength(1);
+      expect(links.get("invoice")).toBe("made-1");
+    });
+
+    it("doesn't put a second payment in Zoho Books", async () => {
+      const { db, links } = await ours("zoho_books", { client: "contact-1", invoice: "zoho-inv-1" });
+      const books = zoho();
+      await expect(runAccountingJob(env, db, paymentJob)).rejects.toThrow("timeout");
+      await runAccountingJob(env, db, paymentJob);
+      expect(books.made).toMatchObject([{ reference_number: "pay-1", invoices: [{ invoice_id: "zoho-inv-1", amount_applied: 45 }] }]);
+      expect(books.posts).toHaveLength(1);
+      expect(links.get("payment")).toBe("made-1");
+    });
+
+    // An invoice the books have, changed since (here a $25 late fee went on): queued again, it's updated.
+    const changed = { ...invoice, invoice_line_items: [...invoice.invoice_line_items, { name: "Late fee", description: null, quantity: 1, unit_price: 25, taxable: false, service_id: null, sort: 1 }] };
+    /** The provider's answers, by method and path; every request is kept. */
+    function books(answer: (method: string, url: URL) => unknown) {
+      const calls: Array<{ method: string; url: URL; body: any }> = [];
+      vi.stubGlobal("fetch", async (input: string, init?: RequestInit) => {
+        const url = new URL(input);
+        const method = init?.method ?? "GET";
+        calls.push({ method, url, body: init?.body ? JSON.parse(String(init.body)) : null });
+        return Response.json(answer(method, url));
+      });
+      return calls;
+    }
+
+    it("updates an invoice QuickBooks has, with the SyncToken it has now", async () => {
+      const { db, links } = await ours("quickbooks", { client: "cust-1", invoice: "qbo-inv-1" }, [], changed);
+      const calls = books((method) => ({ Invoice: { Id: "qbo-inv-1", SyncToken: method === "GET" ? "3" : "4" } }));
+      await runAccountingJob(env, db, invoiceJob);
+      expect(calls.map((c) => [c.method, c.url.pathname.split("/").at(-1)])).toEqual([["GET", "qbo-inv-1"], ["POST", "invoice"]]);
+      const sent = calls[1]!.body;
+      expect(sent).toMatchObject({ Id: "qbo-inv-1", SyncToken: "3", sparse: true, DocNumber: "1042", CustomerRef: { value: "cust-1" }, TxnTaxDetail: { TotalTax: 0 } });
+      // The lines replace QuickBooks' own; with no discount, no discount line.
+      expect(sent.Line.map((l: any) => [l.DetailType, l.Amount])).toEqual([["SalesItemLineDetail", 45], ["SalesItemLineDetail", 25]]);
+      expect(links.get("invoice")).toBe("qbo-inv-1");
+    });
+
+    it("updates an invoice Zoho Books has, its lines and discount replacing Zoho's", async () => {
+      const { db, links } = await ours("zoho_books", { client: "contact-1", invoice: "zoho-inv-1" }, [], changed);
+      const calls = books(() => ({ code: 0, invoice: { invoice_id: "zoho-inv-1" } }));
+      await runAccountingJob(env, db, invoiceJob);
+      expect(calls.map((c) => [c.method, c.url.pathname.split("/").slice(-2).join("/")])).toEqual([["PUT", "invoices/zoho-inv-1"]]);
+      expect(calls[0]!.body).toMatchObject({ customer_id: "contact-1", reference_number: "1042", discount: 0, line_items: [{ name: "Mowing", rate: 45 }, { name: "Late fee", rate: 25 }] });
+      expect(links.get("invoice")).toBe("zoho-inv-1");
+    });
+
+    it("fails an update the books refuse, for the outbox to try again", async () => {
+      const { db } = await ours("quickbooks", { client: "cust-1", invoice: "qbo-inv-1" }, [], changed);
+      vi.stubGlobal("fetch", async () => Response.json({ Fault: { Error: [{ Message: "Stale Object Error" }] } }, { status: 400 }));
+      await expect(runAccountingJob(env, db, invoiceJob)).rejects.toThrow("Stale Object Error");
+    });
+
+    it("leaves the invoice as it is when a payment needs it", async () => {
+      const { db } = await ours("zoho_books", { client: "contact-1", invoice: "zoho-inv-1" }, [], changed);
+      const calls = books(() => ({ code: 0, customerpayments: [], payment: { payment_id: "zoho-pay-1" } }));
+      await runAccountingJob(env, db, paymentJob);
+      expect(calls.map((c) => [c.method, c.url.pathname.split("/").at(-1)])).toEqual([["GET", "customerpayments"], ["POST", "customerpayments"]]);
+    });
+  });
+
+  // A business tried the sync against QuickBooks' sandbox company, then connected its real one. The
+  // sandbox's ids mean nothing in the real books, or are other records' there.
+  describe("links made in other books", () => {
+    const invoice = {
+      id: "inv-1", number: 1042, client_id: "client-1", issued_on: "2026-10-17", due_on: null, subject: null, tax_rate: 0, tax_amount: 0, discount_amount: 0,
+      invoice_line_items: [{ name: "Mowing", description: null, quantity: 1, unit_price: 45, taxable: false, service_id: null, sort: 0 }],
+    };
+    const payment = { id: "pay-1", client_id: "client-1", invoice_id: "inv-1", amount: 45, method: "card", received_at: "2026-10-17T15:00:00Z" };
+    type Link = { provider: string; account_id: string; entity: string; local_id: string; external_id: string };
+    const sandbox = (entity: string, local_id: string, external_id: string): Link => ({ provider: "quickbooks", account_id: "sandbox-1", entity, local_id, external_id });
+
+    /** Our side: the apps connected (each with its books), and the links, each found only by what the query asks for. */
+    async function ours(links: Link[], connected: Array<{ provider: string; external_account_id: string }> = [{ provider: "quickbooks", external_account_id: "real-1" }], rows: unknown[] = []) {
+      const ciphertext = await encryptJson(env, { access_token: "token", expires_at: Date.now() + 3_600_000 });
+      const { db, queries } = fakeDb(
+        (q) => {
+          if (q.table === "integrations") {
+            if (verb(q) !== "select") return {};
+            const asked = call(q, "in")![2] as string[];
+            const found = connected.filter((i) => asked.includes(i.provider)).sort((a, b) => a.provider.localeCompare(b.provider))[0];
+            return { data: found ? { ...found, settings: {} } : null };
+          }
+          if (q.table === "integration_secrets") return { data: { ciphertext } };
+          if (q.table === "clients") return { data: { id: "client-1", display_name: "Ada Alder", company_name: null, email: null, phone: null } };
+          if (q.table === "invoices") return { data: invoice };
+          if (q.table === "payments") return { data: payment };
+          if (q.table === "sync_links") {
+            if (verb(q) === "upsert") {
+              links.push(call(q, "upsert")![1]);
+              return {};
+            }
+            const match = call(q, "match")![1] as Record<string, string>;
+            const found = links.filter((l) => Object.entries(match).every(([key, value]) => key === "company_id" || l[key as keyof Link] === value));
+            return { data: call(q, "maybeSingle") ? (found[0] ?? null) : found };
+          }
+          return { data: null };
+        },
+        (fn) => (fn === "claim_outbox" ? { data: rows } : {}),
+      );
+      return { db, queries, links };
+    }
+
+    /** QuickBooks: it has nothing of ours yet, makes what it's sent, and keeps every request. */
+    function quickbooks() {
+      const calls: Array<{ method: string; url: URL; body: any }> = [];
+      vi.stubGlobal("fetch", async (input: string, init?: RequestInit) => {
+        const url = new URL(input);
+        const method = init?.method ?? "GET";
+        const body = init?.body ? JSON.parse(String(init.body)) : null;
+        calls.push({ method, url, body });
+        if (method === "GET") return Response.json({ QueryResponse: {} });
+        const kind = url.pathname.split("/").at(-1)!;
+        return Response.json({ [kind[0]!.toUpperCase() + kind.slice(1)]: { Id: `real-${kind}-1`, SyncToken: "0" } });
+      });
+      return calls;
+    }
+
+    it("aren't used: an edited invoice goes to the books connected now as new, not over their invoice with the old id", async () => {
+      const { db, links } = await ours([sandbox("client", "client-1", "7"), sandbox("invoice", "inv-1", "12")]);
+      const calls = quickbooks();
+      await runAccountingJob(env, db, { company_id: COMPANY, topic: "accounting.invoice", payload: { invoice_id: "inv-1" } });
+      expect(calls.every((c) => c.url.pathname.startsWith("/v3/company/real-1/"))).toBe(true);
+      // No read or update of invoice 12, which in the real books is somebody else's.
+      expect(calls.filter((c) => c.url.pathname.endsWith("/invoice/12") || c.body?.Id)).toEqual([]);
+      const posts = calls.filter((c) => c.method === "POST");
+      expect(posts.map((c) => c.url.pathname.split("/").at(-1))).toEqual(["customer", "invoice"]);
+      // And not for the sandbox's customer 7.
+      expect(posts[1]!.body).toMatchObject({ DocNumber: "1042", CustomerRef: { value: "real-customer-1" } });
+      expect(links.filter((l) => l.account_id === "real-1").map((l) => [l.entity, l.external_id])).toEqual([["client", "real-customer-1"], ["invoice", "real-invoice-1"]]);
+    });
+
+    it("don't stop a payment reaching the books connected now", async () => {
+      const { db, links } = await ours([sandbox("client", "client-1", "7"), sandbox("invoice", "inv-1", "12"), sandbox("payment", "pay-1", "31")]);
+      const calls = quickbooks();
+      await runAccountingJob(env, db, { company_id: COMPANY, topic: "accounting.payment", payload: { payment_id: "pay-1" } });
+      const sent = calls.find((c) => c.method === "POST" && c.url.pathname.endsWith("/payment"))!;
+      expect(sent.body).toMatchObject({ CustomerRef: { value: "real-customer-1" }, TotalAmt: 45, Line: [{ LinkedTxn: [{ TxnId: "real-invoice-1" }] }] });
+      expect(links).toContainEqual(expect.objectContaining({ account_id: "real-1", entity: "payment", local_id: "pay-1", external_id: "real-payment-1" }));
+    });
+
+    it("are used again by the books they were made in", async () => {
+      const { db, links } = await ours([sandbox("client", "client-1", "7"), sandbox("invoice", "inv-1", "12")], [{ provider: "quickbooks", external_account_id: "sandbox-1" }]);
+      const calls = quickbooks();
+      await runAccountingJob(env, db, { company_id: COMPANY, topic: "accounting.invoice", payload: { invoice_id: "inv-1", provider: "quickbooks", account_id: "sandbox-1" } });
+      expect(calls.map((c) => [c.method, c.url.pathname.split("/").slice(-2).join("/")])).toEqual([["GET", "invoice/12"], ["POST", "sandbox-1/invoice"]]);
+      expect(calls[1]!.body).toMatchObject({ Id: "12", CustomerRef: { value: "7" } });
+      expect(links).toHaveLength(2);
+    });
+
+    const queuedFor = (provider: string, account_id: string) => ({ id: 11, company_id: COMPANY, topic: "accounting.invoice", payload: { invoice_id: "inv-1", provider, account_id }, attempts: 1 });
+
+    it.each([
+      ["another QuickBooks company", [{ provider: "quickbooks", external_account_id: "real-1" }]],
+      ["Zoho Books instead", [{ provider: "zoho_books", external_account_id: "org-1" }]],
+    ])("leave a change queued for the old books unsent with %s connected", async (_, connected) => {
+      const fetch = vi.fn();
+      vi.stubGlobal("fetch", fetch);
+      const { queries, links } = await ours([], connected, [queuedFor("quickbooks", "sandbox-1")]);
+      expect(await runTask("outbox", env)).toEqual({ claimed: 1, done: 0, failed: 1 });
+      expect(fetch).not.toHaveBeenCalled();
+      expect(links).toEqual([]);
+      // Set aside rather than tried again, and not shown as the connected books' problem.
+      expect(call(queries.find((q) => q.table === "outbox")!, "update")![1]).toMatchObject({ dead_at: expect.any(String), last_error: expect.stringContaining("other books") });
+      expect(integrationWrites(queries)).toEqual([]);
+    });
+
+    it("keep a change queued for books that are signed out waiting, as before", async () => {
+      const { queries } = await ours([], [], [queuedFor("quickbooks", "sandbox-1")]);
+      expect(await runTask("outbox", env)).toEqual({ claimed: 1, done: 0, failed: 1 });
+      expect(call(queries.find((q) => q.table === "outbox")!, "update")![1]).toMatchObject({ dead_at: null, last_error: expect.stringContaining("isn't connected") });
+    });
+
+    it("send a change queued for the books connected now, picking them out when both apps are connected", async () => {
+      const both = [{ provider: "quickbooks", external_account_id: "real-1" }, { provider: "zoho_books", external_account_id: "org-1" }];
+      const { queries, links } = await ours([], both, [queuedFor("zoho_books", "org-1")]);
+      const hosts: string[] = [];
+      vi.stubGlobal("fetch", async (input: string, init?: RequestInit) => {
+        hosts.push(new URL(input).host);
+        if (init?.method !== "POST") return Response.json({ code: 0, invoices: [] });
+        return Response.json({ code: 0, contact: { contact_id: "contact-1" }, invoice: { invoice_id: "zoho-inv-1" } });
+      });
+      expect(await runTask("outbox", env)).toEqual({ claimed: 1, done: 1, failed: 0 });
+      expect(new Set(hosts)).toEqual(new Set(["www.zohoapis.com"]));
+      expect(links.map((l) => [l.provider, l.account_id, l.entity])).toEqual([["zoho_books", "org-1", "client"], ["zoho_books", "org-1", "invoice"]]);
+      expect(call(queries.find((q) => q.table === "outbox")!, "update")![1]).toMatchObject({ done_at: expect.any(String) });
+    });
+  });
+});
+
+describe("automation runs", () => {
+  // Midday, whatever the hour the tests run at: a rule's text to a client waits for 8am between 9pm and 8am.
+  beforeEach(() => void vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-10-17T15:00:00Z") }));
+
+  const run = (id: number) => ({
+    id, company_id: COMPANY, rule_id: `rule-${id}`, subject_type: "client", subject_id: "client-1", result: [], status: "running", attempts: 1, locked_until: "2026-10-17T15:05:00.123456+00:00", claim_token: "claim-1",
+  });
+
+  it("are skipped once another worker has claimed them", async () => {
+    const runs = [run(1), run(2)];
+    // The batch took so long that, by run 2, another worker had claimed it.
+    const { queries, rpcs } = fakeDb(
+      () => ({ data: null }), // the rule is gone, so a run that goes ahead is skipped
+      (fn, args) =>
+        fn === "claim_automation_runs" ? { data: runs } : fn === "start_automation_run" ? { data: args.p_id === 1 } : fn === "finish_automation_run" ? { data: true } : {},
+    );
+    expect(await processAutomations(env, { limit: 50 })).toEqual({ claimed: 2, done: 0, skipped: 1, failed: 0, waiting: 0, lost: 1 });
+
+    expect(rpcs.filter((r) => r.fn === "start_automation_run").map((r) => r.args)).toEqual([
+      { p_id: 1, p_token: "claim-1" },
+      { p_id: 2, p_token: "claim-1" },
+    ]);
+    expect(queries.filter((q) => q.table === "automation_rules").map((q) => call(q, "eq"))).toEqual([["eq", "id", "rule-1"]]);
+    // Finished with the claim's token, so it's recorded only while this worker still holds the run.
+    expect(rpcs.filter((r) => r.fn === "finish_automation_run").map((r) => r.args)).toEqual([
+      { p_id: 1, p_token: "claim-1", p_status: "skipped", p_result: [], p_error: "The rule was turned off or deleted." },
+    ]);
+    expect(rpcs.some((r) => r.fn === "release_automation_runs")).toBe(false);
+  });
+
+  it("aren't done, or quietly skipped, when the claim can't be checked", async () => {
+    const { queries, rpcs } = fakeDb(
+      () => ({ data: null }),
+      (fn) =>
+        fn === "claim_automation_runs"
+          ? { data: [run(1), run(2)] }
+          : fn === "start_automation_run"
+            ? { error: { message: "Could not find the function public.start_automation_run in the schema cache" } }
+            : {},
+    );
+    await expect(processAutomations(env, { limit: 50 })).rejects.toThrow("schema cache");
+    expect(queries.filter((q) => q.table === "automation_rules")).toEqual([]);
+    // The runs it didn't start are free for the next batch now, not in five minutes.
+    expect(rpcs.filter((r) => r.fn === "release_automation_runs").map((r) => r.args)).toEqual([{ p_token: "claim-1", p_ids: [1, 2] }]);
+  });
+
+  it("aren't recorded or counted by a worker whose claim has gone", async () => {
+    const rows: Record<string, unknown> = {
+      automation_rules: { id: "rule-1", name: "Thank them", enabled: true, conditions: [], actions: [], run_count: 4 },
+      companies: { id: COMPANY, name: "Acme", timezone: "UTC", currency: "USD", settings: {}, address: {} },
+      clients: { id: "client-1", display_name: "Ana Smith", email: null, phone: null, tags: [], status: "active", lead_source: null },
+    };
+    const { queries, rpcs } = fakeDb(
+      (q) => ({ data: verb(q) === "select" ? (rows[q.table] ?? null) : null }),
+      // By the time it's done, another worker has claimed the run.
+      (fn) => (fn === "claim_automation_runs" ? { data: [run(1)] } : fn === "start_automation_run" ? { data: true } : { data: false }),
+    );
+    expect(await processAutomations(env, { limit: 50 })).toEqual({ claimed: 1, done: 0, skipped: 0, failed: 0, waiting: 0, lost: 1 });
+    expect(rpcs.filter((r) => r.fn === "finish_automation_run").map((r) => r.args.p_status)).toEqual(["done"]);
+    expect(queries.filter((q) => q.table === "automation_rules" && verb(q) === "update")).toEqual([]);
+  });
+
+  it("know the sub, their price and their reason when a sub turns an offer down", async () => {
+    const rows: Record<string, unknown> = {
+      automation_rules: {
+        id: "rule-1", name: "Tell me", trigger: "sub_offer.declined", enabled: true, conditions: [], run_count: 0,
+        actions: [{ type: "notify", roles: ["owner"], title: "{{sub.name}} turned down {{title}} at {{sub.price}}", body: "They said: {{sub.reason}}" }],
+      },
+      companies: { id: COMPANY, name: "Romeo Roofing", timezone: "America/New_York", currency: "USD", settings: {}, address: {} },
+      jobs: { number: 7, title: "Smith roof", status: "active", kind: "one_off", financials: { contract_total: 10800 }, client_id: null, property_id: null, property: null, lines: [] },
+      activity: { data: { job_pay_id: "pay-1", sub_name: "Apex Roofing", total: 2210, was: 2040, change: true, reason: "Same roof, same price" } },
+      memberships: [{ user_id: "owner-1", role: "owner" }],
+    };
+    const { queries } = fakeDb(
+      (q) => ({ data: verb(q) === "select" ? (rows[q.table] ?? null) : null }),
+      (fn) =>
+        fn === "claim_automation_runs"
+          ? { data: [{ ...run(1), subject_type: "job", subject_id: "job-1", activity_id: 99 }] }
+          : fn === "start_automation_run" || fn === "finish_automation_run" ? { data: true } : {},
+    );
+    expect(await processAutomations(env, { limit: 50 })).toMatchObject({ done: 1 });
+    // The event's own data, read from the activity that queued the run.
+    expect(queries.filter((q) => q.table === "activity").map((q) => q.calls.filter(([n]) => n === "eq"))).toEqual([[["eq", "company_id", COMPANY], ["eq", "id", 99]]]);
+    const sent = call(queries.find((q) => q.table === "notifications" && verb(q) === "insert")!, "insert")![1];
+    expect(sent).toEqual([expect.objectContaining({ user_id: "owner-1", title: "Apex Roofing turned down Smith roof at $2,210.00", body: "They said: Same roof, same price", link: "/jobs/job-1" })]);
+  });
+
+  /** A sub_offer.declined rule's run on the Smith roof job, as the database would queue it. */
+  const offerRun = (actions: unknown[], memberships: unknown[], roles: Record<string, string[]> = {}) => {
+    const rows: Record<string, unknown> = {
+      automation_rules: { id: "rule-1", name: "Tell me", trigger: "sub_offer.declined", enabled: true, conditions: [], run_count: 0, actions },
+      companies: { id: COMPANY, name: "Romeo Roofing", timezone: "America/New_York", currency: "USD", settings: {}, address: {} },
+      jobs: { number: 7, title: "Smith roof", status: "active", kind: "one_off", financials: { contract_total: 10800 }, client_id: "client-1", property_id: null, property: null, lines: [] },
+      clients: { id: "client-1", display_name: "Ann Client", email: "ann@example.com", phone: "+15125550111", tags: [], status: "active", lead_source: null },
+      activity: { data: { job_pay_id: "pay-1", sub_name: "Apex Roofing", total: 2210, reason: "Too far" } },
+      memberships,
+    };
+    return fakeDb(
+      (q) => {
+        if (q.table === "company_roles") return { data: Object.entries(roles).map(([id, permissions]) => ({ id, permissions })) };
+        return { data: verb(q) === "select" ? (rows[q.table] ?? null) : null };
+      },
+      (fn) =>
+        fn === "claim_automation_runs"
+          ? { data: [{ ...run(1), subject_type: "job", subject_id: "job-1", activity_id: 99 }] }
+          : fn === "start_automation_run" || fn === "finish_automation_run" ? { data: true } : {},
+    );
+  };
+
+  it("about a sub's offer tell only the office with the Subcontractors area, whoever the rule names", async () => {
+    const memberships = [
+      { user_id: "owner-1", role: "owner", role_id: null },
+      { user_id: "office-1", role: "office", role_id: null },
+      // An office person whose custom role has automations but not subs, and the crew.
+      { user_id: "clerk-1", role: "office", role_id: "role-clerk" },
+      { user_id: "lead-1", role: "crew_lead", role_id: null },
+      { user_id: "crew-1", role: "field_crew", role_id: null },
+    ];
+    // Written straight to the database: crew levels and people by name.
+    const { queries } = offerRun([{ type: "notify", roles: ["owner", "office", "crew_lead", "field_crew"], title: "{{sub.name}} asked {{sub.price}}" }], memberships, { "role-clerk": ["automations"] });
+    expect(await processAutomations(env, { limit: 50 })).toMatchObject({ done: 1 });
+    const sent = call(queries.find((q) => q.table === "notifications" && verb(q) === "insert")!, "insert")![1] as Array<{ user_id: string }>;
+    expect(sent.map((n) => n.user_id).sort()).toEqual(["office-1", "owner-1"]);
+  });
+
+  it("about a sub's offer fail rather than tell someone without the area", async () => {
+    const { queries, rpcs } = offerRun([{ type: "notify", user_ids: ["crew-1"], title: "{{sub.price}}" }], [{ user_id: "crew-1", role: "field_crew", role_id: null }]);
+    expect(await processAutomations(env, { limit: 50 })).toMatchObject({ failed: 1 });
+    expect(queries.some((q) => q.table === "notifications" && verb(q) === "insert")).toBe(false);
+    expect(rpcs.find((r) => r.fn === "finish_automation_run")!.args.p_error).toMatch(/Only the office with the Subcontractors area/);
+  });
+
+  /** An autopay rule's run, as the database would queue it: a charge on invoice #2 failed, or a client was added. */
+  const autopayRun = (trigger: string, actions: unknown[], memberships: unknown[] = [], roles: Record<string, string[]> = {}) => {
+    const rows: Record<string, unknown> = {
+      automation_rules: { id: "rule-1", name: "Autopay", trigger, enabled: true, conditions: [], run_count: 0, actions },
+      companies: { id: COMPANY, name: "Oakridge Lawn Care", timezone: "America/New_York", currency: "USD", trade_preset: "lawn_exterior", settings: { autopay: { enabled: true } }, address: {} },
+      invoices: { number: 2, subject: "Weekly mow", status: "sent", total: 45, balance_due: 45, client_id: "client-1", job_id: "job-1", lines: [{ name: "Mow" }] },
+      clients: { id: "client-1", display_name: "Pat Lee", email: "pat@example.com", phone: "+15125550111", tags: [], status: "active", lead_source: null },
+      activity: { data: { client_id: "client-1", card: "Visa ending 4242", reason: "Your card was declined.", status: "failed" } },
+      autopay_charges: [{ id: "charge-1" }],
+      memberships,
+    };
+    const subject = trigger === "autopay.failed" ? { subject_type: "invoice", subject_id: "invoice-1" } : { subject_type: "client", subject_id: "client-1" };
+    return fakeDb(
+      (q) => {
+        if (q.table === "company_roles") return { data: Object.entries(roles).map(([id, permissions]) => ({ id, permissions })) };
+        return { data: verb(q) === "select" ? (rows[q.table] ?? null) : null };
+      },
+      (fn) =>
+        fn === "claim_automation_runs"
+          ? { data: [{ ...run(1), ...subject, activity_id: 77 }] }
+          : fn === "start_automation_run" || fn === "renew_automation_run" || fn === "finish_automation_run" ? { data: true } : {},
+    );
+  };
+  const tokenOf = (link: string) => link.match(/\/hub\/([^?\s]+)/)![1]!;
+
+  it("invite a client to autopay by the channel the rule says, skipping who's invited already", async () => {
+    invites.send = async (input) => ({ sent: true, detail: input.channel === "sms" ? "Sent by text." : "Sent by email." });
+    const { rpcs } = autopayRun("client.created", [{ type: "invite_autopay", channel: "sms" }]);
+    expect(await processAutomations(env, { limit: 50, baseUrl: "https://app.test" })).toMatchObject({ done: 1 });
+    expect(invites.calls).toEqual([{ companyId: COMPANY, clientId: "client-1", channel: "sms", baseUrl: "https://app.test", createdBy: null, skipIfRecentDays: 7 }]);
+    expect(rpcs.find((r) => r.fn === "finish_automation_run")!.args.p_result).toEqual([{ type: "invite_autopay", ok: true, detail: "Sent by text." }]);
+
+    // A skip is fine; a reason it can't go out fails the action.
+    invites.send = async () => ({ sent: false, detail: "Skipped: already on autopay" });
+    const skipped = autopayRun("client.created", [{ type: "invite_autopay", channel: "email" }]);
+    expect(await processAutomations(env, { limit: 50, baseUrl: "https://app.test" })).toMatchObject({ done: 1 });
+    expect(skipped.rpcs.find((r) => r.fn === "finish_automation_run")!.args.p_result).toEqual([{ type: "invite_autopay", ok: true, detail: "Skipped: already on autopay" }]);
+
+    invites.send = async () => {
+      throw new Error("Turn on autopay in Settings → Payments first.");
+    };
+    const refused = autopayRun("client.created", [{ type: "invite_autopay", channel: "email" }]);
+    expect(await processAutomations(env, { limit: 50, baseUrl: "https://app.test" })).toMatchObject({ failed: 1 });
+    expect(refused.rpcs.find((r) => r.fn === "finish_automation_run")!.args.p_error).toBe("Turn on autopay in Settings → Payments first.");
+  });
+
+  it("about a failed autopay charge tell the office the card and why, and keep them out of the task", async () => {
+    const sent: Array<{ text: string; subject: string }> = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("resend")) sent.push(JSON.parse(String(init!.body)));
+      return Response.json({ id: "email-1" });
+    });
+    const memberships = [
+      { user_id: "owner-1", role: "owner", role_id: null },
+      { user_id: "office-1", role: "office", role_id: null },
+      // Office whose custom role has automations but not invoices, and the crew.
+      { user_id: "clerk-1", role: "office", role_id: "role-clerk" },
+      { user_id: "crew-1", role: "field_crew", role_id: null },
+    ];
+    const { queries, rpcs } = autopayRun(
+      "autopay.failed",
+      [
+        // Written straight to the database: a crew level too.
+        { type: "notify", roles: ["owner", "office", "field_crew"], title: "Autopay failed on {{autopay.card}}", body: "{{autopay.reason}} {{autopay.link}}" },
+        { type: "send_email", subject: "We couldn't charge your {{autopay.card}}", body: "Hi {{client.first_name}}, {{autopay.reason}} Update it here:\n\n{{autopay.link}}" },
+        { type: "create_task", title: "Call {{client.name}} about {{autopay.card}} ({{autopay.reason}}) {{autopay.link}}", days_from_now: 1 },
+      ],
+      memberships,
+      { "role-clerk": ["automations"] },
+    );
+    const mailing = { ...env, RESEND_API_KEY: "re_test", EMAIL_FROM: "Jobly <hi@jobly.test>" };
+    expect(await processAutomations(mailing, { limit: 50, baseUrl: "https://app.test" })).toMatchObject({ done: 1 });
+    expect(rpcs.find((r) => r.fn === "finish_automation_run")!.args.p_result.map((r: { ok: boolean }) => r.ok)).toEqual([true, true, true]);
+
+    // Only the office with the invoices area is told, with the card and the reason.
+    const notices = call(queries.find((q) => q.table === "notifications" && verb(q) === "insert")!, "insert")![1] as Array<{ user_id: string; title: string; body: string }>;
+    expect(notices.map((n) => n.user_id).sort()).toEqual(["office-1", "owner-1"]);
+    expect(notices[0]!.title).toBe("Autopay failed on Visa ending 4242");
+    expect(notices[0]!.body).toMatch(/^Your card was declined\. https:\/\/app\.test\/hub\/\S+\?view=autopay$/);
+    // The office's notice carries the office's copy of the link, which can't confirm a card or add a tip.
+    expect(await readClientLink(env, tokenOf(notices[0]!.body))).toMatchObject({ c: COMPANY, t: "client", id: "client-1", via: "office" });
+
+    // The client's email has their own link, and is kept as an autopay message (only the money office reads those).
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.subject).toBe("We couldn't charge your Visa ending 4242");
+    expect(sent[0]!.text).toContain("Hi Pat, Your card was declined. Update it here:");
+    const own = await readClientLink(env, tokenOf(sent[0]!.text));
+    expect(own).toMatchObject({ c: COMPANY, t: "client", id: "client-1", own: 1 });
+    expect(own!.via).toBeUndefined();
+    const message = call(queries.find((q) => q.table === "messages" && verb(q) === "insert")!, "insert")![1];
+    expect(message).toMatchObject({ channel: "email", related_type: "autopay", related_id: "client-1", client_id: "client-1" });
+    // The copy kept on the timeline has the office's copy of the link, in the same words.
+    expect(message.body).toContain("Hi Pat, Your card was declined. Update it here:");
+    expect(await readClientLink(env, tokenOf(message.body))).toMatchObject({ c: COMPANY, t: "client", id: "client-1", via: "office" });
+
+    // The task is on the schedule, where the crew sees it: no card, reason or link.
+    const task = call(queries.find((q) => q.table === "visits" && verb(q) === "insert")!, "insert")![1] as { title: string };
+    expect(task.title).toBe("Call Pat Lee about  ()");
+  });
+
+  it("text the client their own links, and keep the office's copies of them on the timeline", async () => {
+    const texts: string[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("twilio")) texts.push(new URLSearchParams(String(init!.body)).get("Body")!);
+      return Response.json({ sid: "SM1" });
+    });
+    const { queries, rpcs } = autopayRun("autopay.failed", [{ type: "send_sms", body: "Pay invoice #{{number}}: {{link}} Or update your card: {{autopay.link}}" }]);
+    const texting = { ...env, TWILIO_ACCOUNT_SID: "AC1", TWILIO_AUTH_TOKEN: "t", TWILIO_FROM_NUMBER: "+15125550000" };
+    expect(await processAutomations(texting, { limit: 50, baseUrl: "https://app.test" })).toMatchObject({ done: 1 });
+    expect(rpcs.find((r) => r.fn === "finish_automation_run")!.args.p_result).toEqual([expect.objectContaining({ type: "send_sms", ok: true })]);
+
+    const links = (text: string) => [...text.matchAll(/\/hub\/([^?\s]+)/g)].map((m) => m[1]!);
+    expect(texts).toHaveLength(1);
+    const sent = await Promise.all(links(texts[0]!).map((token) => readClientLink(env, token)));
+    expect(sent).toMatchObject([{ t: "invoice", id: "invoice-1" }, { t: "client", id: "client-1" }]);
+    for (const link of sent) expect(link!.via).toBeUndefined();
+    for (const link of sent) expect(link).toMatchObject({ own: 1 });
+
+    const message = call(queries.find((q) => q.table === "messages" && verb(q) === "insert")!, "insert")![1] as { channel: string; body: string };
+    expect(message.channel).toBe("sms");
+    expect(message.body).toMatch(/^Pay invoice #2: https:\/\/app\.test\/hub\/\S+ Or update your card: https:\/\/app\.test\/hub\/\S+\?view=autopay$/);
+    const kept = await Promise.all(links(message.body).map((token) => readClientLink(env, token)));
+    expect(kept).toMatchObject([{ t: "invoice", id: "invoice-1", via: "office" }, { t: "client", id: "client-1", via: "office" }]);
+  });
+
+  /** A quote.sent or invoice.sent rule's run, as the database would queue it: quote #7 or invoice #2, for Pat. */
+  const sentRun = (subject: "quote" | "invoice" | "client", actions: unknown[], more: Record<string, unknown> = {}) => {
+    const rows: Record<string, unknown> = {
+      automation_rules: { id: "rule-1", name: "Follow up", trigger: subject === "client" ? "client.created" : `${subject}.sent`, enabled: true, conditions: [], run_count: 0, actions },
+      companies: { id: COMPANY, name: "Oakridge Lawn Care", timezone: "America/New_York", currency: "USD", trade_preset: "lawn_exterior", settings: {}, address: {} },
+      quotes: {
+        number: 7, title: "Spring cleanup", status: "sent", total: 300, tax_rate: 0, discount_amount: 0, range_low: null, range_high: null, priced_on_site_at: null, exact_sent_at: null,
+        roof_package_id: null, option_id: null, client_id: "client-1", property_id: null, property: null, promo: null, lines: [], options: [],
+      },
+      invoices: { number: 2, subject: "Weekly mow", status: "sent", total: 45, balance_due: 45, client_id: "client-1", job_id: "job-1", lines: [{ name: "Mow" }] },
+      clients: { id: "client-1", display_name: "Pat Lee", email: "pat@example.com", phone: "+15125550111", tags: [], status: "active", lead_source: null },
+      autopay_charges: [],
+      ...more,
+    };
+    return fakeDb(
+      (q) => ({ data: verb(q) === "select" ? (rows[q.table] ?? null) : null }),
+      (fn) =>
+        fn === "claim_automation_runs"
+          ? { data: [{ ...run(1), subject_type: subject, subject_id: `${subject}-1` }] }
+          : fn === "start_automation_run" || fn === "renew_automation_run" || fn === "finish_automation_run" ? { data: true } : {},
+    );
+  };
+
+  it("put the office's copy of the client's link in the notes and tasks they add, where the team reads them", async () => {
+    // A note on a sent quote: estimators and crews who see the client read it.
+    const note = sentRun("quote", [{ type: "add_note", body: "Sent {{link}}" }]);
+    expect(await processAutomations(env, { limit: 50, baseUrl: "https://app.test" })).toMatchObject({ done: 1 });
+    const kept = call(note.queries.find((q) => q.table === "messages" && verb(q) === "insert")!, "insert")![1] as { channel: string; body: string };
+    expect(kept.channel).toBe("note");
+    expect(kept.body).toMatch(/^Sent https:\/\/app\.test\/hub\/\S+$/);
+    const noted = await readClientLink(env, tokenOf(kept.body));
+    expect(noted).toMatchObject({ c: COMPANY, t: "quote", id: "quote-1", via: "office" });
+    expect(noted).not.toHaveProperty("own");
+
+    // A task on a sent invoice: it's on the schedule, where the crew sees it.
+    const task = sentRun("invoice", [{ type: "create_task", title: "Follow up on {{link}}", days_from_now: 2 }]);
+    expect(await processAutomations(env, { limit: 50, baseUrl: "https://app.test" })).toMatchObject({ done: 1 });
+    const visit = call(task.queries.find((q) => q.table === "visits" && verb(q) === "insert")!, "insert")![1] as { title: string };
+    expect(visit.title).toMatch(/^Follow up on https:\/\/app\.test\/hub\/\S+$/);
+    // A task's title stops at 200 characters, which cuts the link short (its signature, and now the
+    // time it was made), so what it was minted as is read straight from the start of it.
+    const tasked = Buffer.from(tokenOf(visit.title).split(".")[0]!, "base64url").toString();
+    expect(tasked).toContain(`{"c":"${COMPANY}","t":"invoice","id":"invoice-1","via":"office",`);
+    expect(tasked).not.toContain('"own"');
+
+    // A note from a rule about a client (a new one, say): the office's copy of their Hub home.
+    const welcome = sentRun("client", [{ type: "add_note", body: "Welcome {{link}}" }]);
+    expect(await processAutomations(env, { limit: 50, baseUrl: "https://app.test" })).toMatchObject({ done: 1 });
+    const greeted = call(welcome.queries.find((q) => q.table === "messages" && verb(q) === "insert")!, "insert")![1] as { body: string };
+    const home = await readClientLink(env, tokenOf(greeted.body));
+    expect(home).toMatchObject({ c: COMPANY, t: "client", id: "client-1", via: "office" });
+    expect(home).not.toHaveProperty("own");
+  });
+
+  it("email the client their own link, marked as theirs, for a quote or invoice", async () => {
+    const sent: Array<{ text: string }> = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("resend")) sent.push(JSON.parse(String(init!.body)));
+      return Response.json({ id: "email-1" });
+    });
+    sentRun("invoice", [{ type: "send_email", subject: "Invoice #{{number}}", body: "Pay it here: {{link}}" }]);
+    const mailing = { ...env, RESEND_API_KEY: "re_test", EMAIL_FROM: "Jobly <hi@jobly.test>" };
+    expect(await processAutomations(mailing, { limit: 50, baseUrl: "https://app.test" })).toMatchObject({ done: 1 });
+    expect(sent).toHaveLength(1);
+    const own = await readClientLink(env, tokenOf(sent[0]!.text));
+    expect(own).toMatchObject({ t: "invoice", id: "invoice-1", own: 1 });
+    expect(own).not.toHaveProperty("via");
+  });
+
+  it("email the client's contacts ticked for emails too, with the office's copy of the link, as one message", async () => {
+    const sent: Array<{ to: string[]; text: string }> = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("resend")) sent.push(JSON.parse(String(init!.body)));
+      return Response.json({ id: `email-${sent.length}` });
+    });
+    const client_contacts = [
+      { id: "contact-1", name: "Mo Manager", email: "mo@example.com", phone: "512-555-0122", notify_email: true, notify_sms: true },
+      { id: "contact-2", name: "Sam Spouse", email: "sam@example.com", phone: null, notify_email: false, notify_sms: false },
+    ];
+    const { queries, rpcs } = sentRun("invoice", [{ type: "send_email", subject: "Invoice #{{number}}", body: "Pay it here: {{link}}" }], { client_contacts });
+    const mailing = { ...env, RESEND_API_KEY: "re_test", EMAIL_FROM: "Jobly <hi@jobly.test>" };
+    expect(await processAutomations(mailing, { limit: 50, baseUrl: "https://app.test" })).toMatchObject({ done: 1 });
+    expect(sent.map((m) => m.to)).toEqual([["pat@example.com"], ["mo@example.com"]]);
+    // Only the client's own address carries the link that can agree to autopay or tip on their card.
+    expect(await readClientLink(env, tokenOf(sent[0]!.text))).toMatchObject({ t: "invoice", id: "invoice-1", own: 1 });
+    const copy = await readClientLink(env, tokenOf(sent[1]!.text));
+    expect(copy).toMatchObject({ t: "invoice", id: "invoice-1", via: "office" });
+    expect(copy).not.toHaveProperty("own");
+    const messages = queries.filter((q) => q.table === "messages" && verb(q) === "insert");
+    expect(messages).toHaveLength(1);
+    expect(call(messages[0]!, "insert")![1].recipients).toEqual([{ to: "pat@example.com", name: "Pat Lee" }, { to: "mo@example.com", name: "Mo Manager" }]);
+    expect(rpcs.find((r) => r.fn === "finish_automation_run")!.args.p_result).toEqual([{ type: "send_email", ok: true, detail: "Emailed pat@example.com and mo@example.com" }]);
+  });
+
+  it("say in the preview who an email would reach, and keep marketing and card rules to the client alone", async () => {
+    const { loadContext, previewRecipients } = await import("../src/services/automations");
+    const client_contacts = [{ id: "contact-1", name: "Mo Manager", email: "mo@example.com", phone: "512-555-0122", notify_email: true, notify_sms: true }];
+    const { db } = sentRun("invoice", [], { client_contacts });
+    const ctx = (await loadContext(db, COMPANY, "invoice", "invoice-1"))!;
+    expect(await previewRecipients(db, ctx, "invoice.sent", "email")).toEqual(["pat@example.com", "mo@example.com"]);
+    expect(await previewRecipients(db, ctx, "invoice.sent", "sms")).toEqual(["+15125550111", "512-555-0122"]);
+    // A re-engage email is marketing, a referral credit is the client's, and autopay is about their card.
+    for (const trigger of ["client.inactive", "referral.earned", "autopay.failed", "payment_method.expiring"]) {
+      expect(await previewRecipients(db, ctx, trigger, "email"), trigger).toEqual(["pat@example.com"]);
+    }
+  });
+
+  it("text the client's contacts ticked for texts, but never a number that texted STOP", async () => {
+    const texts: string[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("twilio")) texts.push(new URLSearchParams(String(init!.body)).get("To")!);
+      return Response.json({ sid: "SM1" });
+    });
+    const client_contacts = [
+      { id: "contact-1", name: "Mo Manager", email: null, phone: "512-555-0122", notify_email: true, notify_sms: true },
+      { id: "contact-2", name: "Sam Spouse", email: null, phone: "(512) 555-0133", notify_email: true, notify_sms: true },
+    ];
+    const texting = { ...env, TWILIO_ACCOUNT_SID: "AC1", TWILIO_AUTH_TOKEN: "t", TWILIO_FROM_NUMBER: "+15125550000" };
+    // Sam's number texted STOP to this company.
+    const { rpcs } = sentRun("invoice", [{ type: "send_sms", body: "Invoice #{{number}} is ready" }], { client_contacts, sms_stops: [{ phone_key: "5125550133" }] });
+    expect(await processAutomations(texting, { limit: 50, baseUrl: "https://app.test" })).toMatchObject({ done: 1 });
+    expect(texts).toEqual(["+15125550111", "512-555-0122"]);
+    expect(rpcs.find((r) => r.fn === "finish_automation_run")!.args.p_result).toEqual([{ type: "send_sms", ok: true, detail: "Texted +15125550111 and 512-555-0122" }]);
+
+    // A company that hasn't said yes to contacts yet: the client alone, as before.
+    texts.length = 0;
+    sentRun("invoice", [{ type: "send_sms", body: "Invoice #{{number}} is ready" }], {
+      client_contacts,
+      companies: { id: COMPANY, name: "Oakridge Lawn Care", timezone: "America/New_York", currency: "USD", trade_preset: "lawn_exterior", settings: { contact_messages: { enabled: false, pending: true } }, address: {} },
+    });
+    expect(await processAutomations(texting, { limit: 50, baseUrl: "https://app.test" })).toMatchObject({ done: 1 });
+    expect(texts).toEqual(["+15125550111"]);
+  });
+
+  it("about autopay fail rather than tell someone without the invoices area, and never add a client note", async () => {
+    const { queries, rpcs } = autopayRun(
+      "payment_method.expiring",
+      [{ type: "notify", user_ids: ["clerk-1"], title: "{{autopay.card}} expires" }, { type: "add_note", body: "{{autopay.card}}" }],
+      [{ user_id: "clerk-1", role: "office", role_id: "role-clerk" }],
+      { "role-clerk": ["automations"] },
+    );
+    expect(await processAutomations(env, { limit: 50, baseUrl: "https://app.test" })).toMatchObject({ failed: 1 });
+    expect(queries.some((q) => q.table === "notifications" && verb(q) === "insert")).toBe(false);
+    expect(queries.some((q) => q.table === "messages")).toBe(false);
+    expect(rpcs.find((r) => r.fn === "finish_automation_run")!.args.p_result).toEqual([
+      { type: "notify", ok: false, detail: "Only the office with the Invoices and payments area hears about autopay, and nobody this rule notifies has it." },
+      { type: "add_note", ok: false, detail: "This action doesn't fit what starts this rule." },
+    ]);
+  });
+
+  it("know whether the client and the invoice are on autopay, for the rule's conditions", async () => {
+    const { loadContext } = await import("../src/services/automations");
+    const { db, queries } = autopayRun("autopay.failed", []);
+    expect((await loadContext(db, COMPANY, "invoice", "invoice-1"))?.facts.autopay).toBe("yes");
+    const charges = queries.find((q) => q.table === "autopay_charges")!;
+    expect(charges.calls).toEqual(expect.arrayContaining([["eq", "company_id", COMPANY], ["eq", "invoice_id", "invoice-1"], ["neq", "status", "called_off"]]));
+    expect((await loadContext(db, COMPANY, "client", "client-1"))?.facts.autopay).toBe("no"); // no agreement row in this fake
+    const agreements = queries.find((q) => q.table === "autopay_authorizations")!;
+    expect(agreements.calls).toEqual(expect.arrayContaining([["eq", "client_id", "client-1"], ["is", "revoked_at", null], ["is", "paused_at", null]]));
+  });
+
+  it("about autopay preview with the event's card, the office's copy of the link, and a warning while autopay is off", async () => {
+    autopayRun("autopay.failed", []);
+    const db = current.db as { from: (table: string) => unknown };
+    const from = db.from;
+    // The person previewing is office staff; the latest autopay.failed event is on invoice #2.
+    db.from = (table: string) => {
+      if (table === "memberships") return fakeChain({ role: "office", role_id: null });
+      if (table === "activity") return fakeChain([{ id: 77, subject_type: "invoice", subject_id: "invoice-1" }], { data: { data: { card: "Visa ending 4242", reason: "Your card was declined." } } });
+      return from(table);
+    };
+    const preview = (actions: unknown[]) =>
+      app.request(
+        "/api/automations/preview",
+        { method: "POST", headers: { Authorization: "Bearer token", "X-Company-Id": COMPANY, "Content-Type": "application/json" }, body: JSON.stringify({ name: "Failed", trigger: "autopay.failed", conditions: [], actions }) },
+        { ...env, APP_URL: "https://app.test" },
+      );
+    const res = await preview([
+      { type: "notify", roles: ["owner"], title: "{{autopay.card}}", body: "{{autopay.link}}" },
+      { type: "invite_autopay", channel: "email" },
+    ]);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { previews: Array<{ type: string; title?: string; body?: string; to?: string }>; warnings: string[] };
+    expect(body.previews[0]).toMatchObject({ type: "notify", title: "Visa ending 4242" });
+    expect(await readClientLink(env, tokenOf(body.previews[0]!.body!))).toMatchObject({ t: "client", id: "client-1", via: "office" });
+    expect(body.previews[1]).toMatchObject({ type: "invite_autopay", to: "pat@example.com" });
+    expect(body.previews[1]!.body).toContain("[autopay link]");
+    expect(body.warnings).toContain("Autopay isn't on (Settings → Payments, and a Stripe key that can save cards), so invites won't go out until it is.");
+    invites.available = true;
+    const on = (await (await preview([{ type: "invite_autopay", channel: "email" }])).json()) as { warnings: string[] };
+    expect(on.warnings.some((w) => w.startsWith("Autopay isn't on"))).toBe(false);
+
+    // A task can't show the card, so the rule doesn't preview.
+    expect((await preview([{ type: "create_task", title: "{{autopay.card}}", days_from_now: 1 }])).status).toBe(400);
+  });
+
+  it("about a sub's offer only notify and make tasks, and a task never shows their price or reason", async () => {
+    const texts: string[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => (texts.push(String(input)), Response.json({ sid: "SM1" })));
+    const { queries, rpcs } = offerRun(
+      [
+        { type: "send_sms", body: "Apex wanted {{sub.price}}" },
+        { type: "add_note", body: "{{sub.price}}" },
+        { type: "create_task", title: "Call {{sub.name}} back about {{sub.price}} ({{sub.reason}})", days_from_now: 1 },
+      ],
+      [],
+    );
+    const texting = { ...env, TWILIO_ACCOUNT_SID: "AC1", TWILIO_AUTH_TOKEN: "t", TWILIO_FROM_NUMBER: "+15125550000" };
+    expect(await processAutomations(texting, { limit: 50 })).toMatchObject({ failed: 1 });
+    expect(texts.filter((u) => u.includes("twilio"))).toEqual([]);
+    expect(queries.some((q) => q.table === "messages")).toBe(false);
+    const task = call(queries.find((q) => q.table === "visits" && verb(q) === "insert")!, "insert")![1] as { title: string };
+    expect(task.title).toBe("Call Apex Roofing back about  ()");
+    expect(rpcs.find((r) => r.fn === "finish_automation_run")!.args.p_result).toEqual([
+      { type: "send_sms", ok: false, detail: "This action doesn't fit what starts this rule." },
+      { type: "add_note", ok: false, detail: "This action doesn't fit what starts this rule." },
+      expect.objectContaining({ type: "create_task", ok: true }),
+    ]);
+  });
+});
+
+describe("the on my way text", () => {
+  const STARTER = "Hi {{client.first_name}}, this is {{company.name}}. Our crew is on the way to {{address}} now{{eta}}.";
+  /** A visit.en_route run for the on_my_way starter, its visit due `etaAt` (null: not known). */
+  const enRoute = (etaAt: string | null) => {
+    const rows: Record<string, unknown> = {
+      automation_rules: { id: "rule-1", name: "Text the client when the crew is on the way", trigger: "visit.en_route", enabled: true, conditions: [], run_count: 0, actions: [{ type: "send_sms", body: STARTER }] },
+      companies: { id: COMPANY, name: "Oakridge Lawn Care", timezone: "America/New_York", currency: "USD", trade_preset: "lawn_exterior", settings: {}, address: {} },
+      visits: {
+        title: "Weekly mow", kind: "job", status: "en_route", scheduled_on: "2026-10-17", starts_at: null, eta_at: etaAt, job_id: "job-1", property_id: "property-1",
+        property: { line1: "12 Oak St", city: "Oakridge", region: "VA", client_id: "client-1" }, job: { client_id: "client-1", kind: "one_off" }, request: null,
+      },
+      clients: { id: "client-1", display_name: "Pat Lee", email: null, phone: "+15125550111", tags: [], status: "active", lead_source: null },
+    };
+    return fakeDb(
+      (q) => ({ data: verb(q) === "select" ? (rows[q.table] ?? null) : null }),
+      (fn) =>
+        fn === "claim_automation_runs"
+          ? { data: [{ id: 1, company_id: COMPANY, rule_id: "rule-1", subject_type: "visit", subject_id: "visit-1", result: [], status: "running", attempts: 1, locked_until: "2026-10-17T15:05:00Z", claim_token: "claim-1" }] }
+          : fn === "start_automation_run" || fn === "renew_automation_run" || fn === "finish_automation_run" ? { data: true } : {},
+    );
+  };
+  const textOf = async (etaAt: string | null) => {
+    const texts: string[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("twilio")) texts.push(new URLSearchParams(String(init!.body)).get("Body")!);
+      return Response.json({ sid: "SM1" });
+    });
+    enRoute(etaAt);
+    const texting = { ...env, TWILIO_ACCOUNT_SID: "AC1", TWILIO_AUTH_TOKEN: "t", TWILIO_FROM_NUMBER: "+15125550000" };
+    expect(await processAutomations(texting, { limit: 50, baseUrl: "https://app.test" })).toMatchObject({ done: 1 });
+    return texts[0];
+  };
+
+  it("says when the crew should get there, and reads just as well when that isn't known", async () => {
+    const soon = new Date(Date.now() + 20.5 * 60_000).toISOString();
+    // Each is the first text this number gets here, so each ends by saying how to stop them.
+    const stop = "\n\nReply STOP to opt out.";
+    expect(await textOf(soon)).toBe(`Hi Pat, this is Oakridge Lawn Care. Our crew is on the way to 12 Oak St, Oakridge, VA now and should arrive in about 20 minutes.${stop}`);
+    expect(await textOf(null)).toBe(`Hi Pat, this is Oakridge Lawn Care. Our crew is on the way to 12 Oak St, Oakridge, VA now.${stop}`);
+    // A time already gone (the text waited) says nothing rather than something wrong.
+    expect(await textOf(new Date(Date.now() - 60_000).toISOString())).toBe(`Hi Pat, this is Oakridge Lawn Care. Our crew is on the way to 12 Oak St, Oakridge, VA now.${stop}`);
+  });
+});
+
+describe("when a crew on its way should arrive", () => {
+  const NOW = Date.parse("2026-10-17T15:00:00Z");
+  const home = { lat: 37.13, lng: -80.41 };
+  const visit = { scheduled_on: "2026-10-17", crew_id: "crew-1", property: home };
+  /** The visit, the company (25 mph) and the crew's last finished visit that day (`previous`). */
+  const world = (previous: unknown, own: object = visit) =>
+    fakeDb((q) => {
+      if (verb(q) === "update") return { data: [{ id: "visit-1", scheduled_on: "2026-10-17", starts_at: null, crew_id: "crew-1", status: "en_route" }] };
+      if (q.table === "companies") return { data: { settings: { schedule: { speed_mph: 25 } } } };
+      return { data: call(q, "neq") ? previous : { status: "scheduled", completed_at: null, ...own } };
+    });
+  const minutesTo = (at: string | null) => (at ? (Date.parse(at) - NOW) / 60_000 : null);
+
+  it("is the drive from where the phone was, timed as routes time drives", async () => {
+    const { db, queries } = world(null);
+    const phone = { lat: 37.18, lng: -80.41 };
+    const at = await arrivalTime(db, COMPANY, "visit-1", phone, "u1", NOW);
+    expect(minutesTo(at)).toBeCloseTo(driveBetween(phone, home, 25).minutes, 3);
+    expect(etaWords(at, NOW)).toBe(" and should arrive in about 10 minutes");
+    expect(queries.some((q) => call(q, "neq"))).toBe(false);
+  });
+
+  it("without the phone's place, is the drive from the crew's last visit finished that day", async () => {
+    const last = { lat: 37.1, lng: -80.5 };
+    const { db, queries } = world({ property: last });
+    const at = await arrivalTime(db, COMPANY, "visit-1", null, "u1", NOW);
+    expect(minutesTo(at)).toBeCloseTo(driveBetween(last, home, 25).minutes, 3);
+    const asked = queries.find((q) => call(q, "neq"))!;
+    expect(asked.calls).toEqual(expect.arrayContaining([["eq", "scheduled_on", "2026-10-17"], ["eq", "status", "completed"], ["neq", "id", "visit-1"], ["eq", "crew_id", "crew-1"], ["order", "completed_at", { ascending: false }]]));
+    // A visit with no crew goes by the person's own last visit.
+    const solo = world({ property: last }, { ...visit, crew_id: null });
+    await arrivalTime(solo.db, COMPANY, "visit-1", null, "u1", NOW);
+    expect(solo.queries.find((q) => call(q, "neq"))!.calls).toContainEqual(["eq", "completed_by", "u1"]);
+  });
+
+  it("isn't known with neither, or when the visit's place isn't on the map", async () => {
+    expect(await arrivalTime(world(null).db, COMPANY, "visit-1", null, "u1", NOW)).toBeNull();
+    expect(await arrivalTime(world({ property: { lat: null, lng: null } }).db, COMPANY, "visit-1", null, "u1", NOW)).toBeNull();
+    expect(await arrivalTime(world(null, { ...visit, property: { lat: null, lng: null } }).db, COMPANY, "visit-1", { lat: 37.18, lng: -80.41 }, "u1", NOW)).toBeNull();
+    expect(etaWords(null)).toBe("");
+  });
+
+  it("is saved with On my way, and where the phone was isn't", async () => {
+    const { db, queries } = world(null);
+    await updateVisit({ db, companyId: COMPANY, role: "field_crew", permissions: ["schedule"], userId: "u1" }, "visit-1", { status: "en_route", forward_only: true, from: { lat: 37.18, lng: -80.41 } });
+    const saved = call(queries.find((q) => verb(q) === "update")!, "update")![1] as Record<string, unknown>;
+    expect(saved).toEqual({ status: "en_route", eta_at: expect.any(String) });
+    expect(Date.parse(saved.eta_at as string)).toBeGreaterThan(Date.now());
+    // Any other status leaves it alone.
+    const other = world(null);
+    await updateVisit({ db: other.db, companyId: COMPANY, role: "field_crew", permissions: ["schedule"], userId: "u1" }, "visit-1", { status: "in_progress", forward_only: true });
+    expect(call(other.queries.find((q) => verb(q) === "update")!, "update")![1]).toEqual({ status: "in_progress" });
+  });
+});
+
+describe("a day's route", () => {
+  it("works 7 to 6 for a business that never set its hours, not from midnight", () => {
+    const visit = {
+      id: "visit-1", title: "Weekly mow", kind: "job", status: "scheduled", starts_at: null, ends_at: null, route_order: null, time_fixed: false,
+      property: { id: "property-1", line1: "12 Oak St", line2: null, city: "Oakridge", region: "VA", postal_code: null, country: "US", lat: 37.13, lng: -80.57 },
+      job: { number: 1, visit_duration_min: 60, client: { display_name: "Pat Lee" } },
+    };
+    const now = new Date("2026-10-16T15:00:00Z");
+    const plan = planDay([visit], { tz: "America/New_York", settings: {} }, "2026-10-19", { now });
+    expect([plan.stops[0]!.planned.start, plan.workEnd]).toEqual([7 * 60, 18 * 60]);
+    // Hours that were set are the hours.
+    const set = planDay([visit], { tz: "America/New_York", settings: { working_hours: { start: "08:30", end: "16:00" } } }, "2026-10-19", { now });
+    expect([set.stops[0]!.planned.start, set.workEnd]).toEqual([8 * 60 + 30, 16 * 60]);
+  });
+});
